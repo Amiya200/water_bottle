@@ -17,8 +17,11 @@ void BLE_Init(BLE_Handle_t *hble, UART_HandleTypeDef *huart)
     hble->pkt_len      = 0;
     hble->pkt_in_frame = 0;
     hble->pkt_ready    = 0;
+    hble->line_len     = 0;
+    hble->line_ready   = 0;
     hble->conn_state   = BLE_STATE_DISCONNECTED;
     memset(hble->pkt_buf, 0, sizeof(hble->pkt_buf));
+    memset(hble->line_buf, 0, sizeof(hble->line_buf));
 }
 
 void BLE_StartReceive(BLE_Handle_t *hble)
@@ -44,6 +47,30 @@ void BLE_RxISR(BLE_Handle_t *hble)
     /* If a complete packet is waiting to be consumed, drop incoming bytes
      * rather than overwriting.  app_logic polls every 1 s — plenty of time. */
     if (hble->pkt_ready) return;
+
+    /* ─── ASCII string-command path (parallel to binary) ────────────────
+     * When we are NOT currently inside a binary frame, treat printable
+     * bytes and CR/LF as an ASCII command line. A binary frame always
+     * begins with 0xAA (BLE_SOF), which is non-printable, so the two
+     * paths never collide for normal text commands.
+     * ------------------------------------------------------------------ */
+    if (!hble->pkt_in_frame && byte != BLE_SOF && !hble->line_ready) {
+        if (byte == '\r' || byte == '\n') {
+            if (hble->line_len > 0U) {
+                hble->line_buf[hble->line_len] = '\0';
+                hble->line_ready = 1;       /* complete line ready */
+            }
+            /* lone CR/LF with empty buffer: ignore */
+        } else if (byte >= 0x20 && byte < 0x7F) {   /* printable ASCII */
+            if (hble->line_len < (BLE_STR_LINE_MAX - 1U)) {
+                hble->line_buf[hble->line_len++] = (char)byte;
+            } else {
+                hble->line_len = 0;   /* overflow: discard partial line */
+            }
+        }
+        /* For ASCII path we do NOT fall through to the binary framer. */
+        if (byte != BLE_SOF) return;
+    }
 
     /* Start of frame detection */
     if (byte == BLE_SOF && !hble->pkt_in_frame) {
@@ -103,6 +130,31 @@ HAL_StatusTypeDef BLE_SendPacket(BLE_Handle_t *hble,
                                   const uint8_t *buf, uint8_t len)
 {
     return HAL_UART_Transmit(hble->huart, (uint8_t *)buf, len, 1000);
+}
+
+/* ─── ASCII string-command I/O ──────────────────────────────── */
+
+/* Pop a complete received line; returns 1 and copies into out (NUL-term). */
+uint8_t BLE_GetLine(BLE_Handle_t *hble, char *out)
+{
+    if (!hble->line_ready) return 0;
+
+    uint8_t i = 0;
+    while (i < (BLE_STR_LINE_MAX - 1U) && hble->line_buf[i] != '\0') {
+        out[i] = hble->line_buf[i];
+        i++;
+    }
+    out[i] = '\0';
+
+    hble->line_ready = 0;
+    hble->line_len   = 0;
+    return 1;
+}
+
+/* Transmit a NUL-terminated string (blocking). */
+HAL_StatusTypeDef BLE_SendStr(BLE_Handle_t *hble, const char *s)
+{
+    return HAL_UART_Transmit(hble->huart, (uint8_t *)s, (uint16_t)strlen(s), 1000);
 }
 
 /* ─── Raw byte send ─────────────────────────────────────────── */

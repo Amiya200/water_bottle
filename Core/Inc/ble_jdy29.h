@@ -24,6 +24,9 @@ typedef enum {
     BLE_STATE_CONNECTED,
 } BLE_ConnState_t;
 
+/* Max length of an ASCII command line (e.g. "RGB,255,128,0"). */
+#define BLE_STR_LINE_MAX  48U
+
 typedef struct {
     UART_HandleTypeDef *huart;
 
@@ -35,6 +38,13 @@ typedef struct {
     uint8_t  pkt_len;                   /* bytes accumulated so far               */
     uint8_t  pkt_in_frame;              /* 1 = SOF seen, accumulating             */
     uint8_t  pkt_ready;                 /* 1 = complete frame waiting to be read  */
+
+    /* ASCII string-command accumulator (runs in PARALLEL with binary frames).
+     * Lets a plain serial terminal send "PING", "RED", "TEMP" etc. terminated
+     * by CR or LF. Binary frames (starting 0xAA) are unaffected. */
+    char     line_buf[BLE_STR_LINE_MAX]; /* assembled ASCII command line          */
+    uint8_t  line_len;                   /* chars accumulated                     */
+    uint8_t  line_ready;                 /* 1 = complete line waiting to be read  */
 
     BLE_ConnState_t conn_state;
 } BLE_Handle_t;
@@ -52,6 +62,13 @@ void    BLE_PollState(BLE_Handle_t *hble);
 uint8_t           BLE_GetPacket(BLE_Handle_t *hble, BLE_Packet_t *out);
 HAL_StatusTypeDef BLE_SendPacket(BLE_Handle_t *hble,
                                   const uint8_t *buf, uint8_t len);
+
+/* ASCII string-command I/O (parallel to binary).
+ * BLE_GetLine: returns 1 and copies a complete NUL-terminated line into `out`
+ *              (caller buffer >= BLE_STR_LINE_MAX). Returns 0 if none ready.
+ * BLE_SendStr: transmit a NUL-terminated string (blocking). */
+uint8_t           BLE_GetLine(BLE_Handle_t *hble, char *out);
+HAL_StatusTypeDef BLE_SendStr(BLE_Handle_t *hble, const char *s);
 
 /* Raw byte send (still available if needed) */
 HAL_StatusTypeDef BLE_SendBytes(BLE_Handle_t *hble,

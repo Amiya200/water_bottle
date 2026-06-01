@@ -109,6 +109,9 @@ void    App_ResetDailyConsumed(AppContext_t *app);
 /* BLE command dispatch — takes binary packet */
 void App_HandleBLECommand(AppContext_t *app, const BLE_Packet_t *pkt);
 
+/* ASCII string-command dispatch (parallel to binary). `line` is mutable. */
+void App_HandleStringCommand(AppContext_t *app, char *line);
+
 /* Individual command handlers */
 void App_Cmd_Timestamp(AppContext_t *app, const BLE_Packet_t *pkt);
 void App_Cmd_InputData(AppContext_t *app, const BLE_Packet_t *pkt);

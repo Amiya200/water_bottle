@@ -195,6 +195,12 @@ void App_TaskBLE(AppContext_t *app)
         App_HandleBLECommand(app, &pkt);
     }
 
+    /* ASCII string commands (parallel to binary protocol) */
+    char line[BLE_STR_LINE_MAX];
+    if (BLE_GetLine(&app->ble, line)) {
+        App_HandleStringCommand(app, line);
+    }
+
     if (BLE_IsConnected(&app->ble) && app->drink_log.dirty) {
         Storage_FlushDrinkLog(&app->drink_log);
     }
@@ -294,6 +300,172 @@ void App_HandleBLECommand(AppContext_t *app, const BLE_Packet_t *pkt)
         App_SendACK(app, pkt->cmd, 0, BLE_ERR_UNKNOWN_CMD);
         break;
     }
+}
+
+/* ─── ASCII string-command handler ──────────────────────────────────────────
+ * Parallel to the binary protocol. Lets a plain serial/BLE terminal control
+ * the device with simple text lines. Replies are short ASCII strings.
+ *
+ *   PING            -> PONG
+ *   STATUS          -> STATUS bat=.. tmp=.. tds=.. ml=.. chg=..
+ *   TEMP            -> TEMP,<c.c>     (current water temperature)
+ *   TDS             -> TDS,<ppm>      (current purity)
+ *   WEIGHT          -> WEIGHT,<grams>
+ *   READ            -> TLM,temp_x10,tds,ml,score
+ *   RED/GREEN/BLUE/WHITE/OFF          -> solid LED colours
+ *   RGB,r,g,b       -> all LEDs to r,g,b
+ *   LAMP,r,g,b      -> lamp colour (also enters lamp pattern)
+ *   BEEP            -> single confirm beep
+ *   BON / BOFF      -> buzzer continuous on (double-beep pattern) / stop
+ *   CAL             -> start empty-bottle calibration (tare)
+ *   TARE            -> alias of CAL
+ *
+ * Uses only tiny local int->string helpers (no printf/snprintf).
+ * --------------------------------------------------------------------------*/
+
+static char *s_u2s(char *d, char *e, uint32_t v)
+{
+    char t[11]; uint8_t n = 0;
+    if (v == 0) { if (d < e - 1) *d++ = '0'; *d = '\0'; return d; }
+    while (v && n < sizeof(t)) { t[n++] = (char)('0' + (v % 10U)); v /= 10U; }
+    while (n && d < e - 1) *d++ = t[--n];
+    *d = '\0'; return d;
+}
+static char *s_i2s(char *d, char *e, int32_t v)
+{
+    if (v < 0) { if (d < e - 1) *d++ = '-'; return s_u2s(d, e, (uint32_t)(-(int64_t)v)); }
+    return s_u2s(d, e, (uint32_t)v);
+}
+static char *s_app(char *d, char *e, const char *s)
+{
+    while (*s && d < e - 1) *d++ = *s++;
+    *d = '\0'; return d;
+}
+
+/* Parse up to max comma-separated ints after the first comma. Returns count. */
+static int s_csv(const char *s, int *out, int max)
+{
+    while (*s && *s != ',') s++;
+    if (*s != ',') return 0;
+    s++;
+    int c = 0;
+    while (*s && c < max) {
+        while (*s == ' ') s++;
+        int neg = 0; if (*s == '-') { neg = 1; s++; }
+        if (*s < '0' || *s > '9') break;
+        int32_t v = 0;
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+        out[c++] = neg ? -v : v;
+        while (*s && *s != ',') s++;
+        if (*s == ',') s++;
+    }
+    return c;
+}
+
+void App_HandleStringCommand(AppContext_t *app, char *line)
+{
+    /* Uppercase the verb up to the first comma (numbers stay intact). */
+    char up[16];
+    uint8_t i = 0;
+    for (; line[i] && line[i] != ',' && i < sizeof(up) - 1U; i++) {
+        char c = line[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        up[i] = c;
+    }
+    up[i] = '\0';
+
+    char out[64];
+    char *e = out + sizeof(out);
+    char *p = out;
+
+    if (strcmp(up, "PING") == 0) { BLE_SendStr(&app->ble, "PONG\r\n"); return; }
+
+    if (strcmp(up, "STATUS") == 0) {
+        p = s_app(p, e, "STATUS bat=");  p = s_u2s(p, e, app->current_bat_pct);
+        p = s_app(p, e, " tmp=");        p = s_i2s(p, e, app->current_temp_x10);
+        p = s_app(p, e, " tds=");        p = s_u2s(p, e, app->current_tds_ppm);
+        p = s_app(p, e, " ml=");         p = s_u2s(p, e, app->consumed_today_ml);
+        p = s_app(p, e, " chg=");        p = s_u2s(p, e, Battery_IsCharging(&app->bat) ? 1U : 0U);
+        p = s_app(p, e, "\r\n");
+        BLE_SendStr(&app->ble, out);
+        return;
+    }
+
+    if (strcmp(up, "TEMP") == 0) {
+        int16_t t = app->current_temp_x10;
+        int16_t whole = t / 10, frac = t % 10; if (frac < 0) frac = -frac;
+        p = s_app(p, e, "TEMP,");
+        if (t < 0 && whole == 0) *p++ = '-';
+        p = s_i2s(p, e, whole); *p++ = '.'; p = s_u2s(p, e, (uint32_t)frac);
+        p = s_app(p, e, "\r\n");
+        BLE_SendStr(&app->ble, out);
+        return;
+    }
+
+    if (strcmp(up, "TDS") == 0) {
+        p = s_app(p, e, "TDS,"); p = s_u2s(p, e, app->current_tds_ppm);
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&app->ble, out); return;
+    }
+
+    if (strcmp(up, "WEIGHT") == 0) {
+        p = s_app(p, e, "WEIGHT,"); p = s_i2s(p, e, (int32_t)app->current_weight_g);
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&app->ble, out); return;
+    }
+
+    if (strcmp(up, "READ") == 0) {
+        p = s_app(p, e, "TLM,"); p = s_i2s(p, e, app->current_temp_x10);
+        *p++ = ',';             p = s_u2s(p, e, app->current_tds_ppm);
+        *p++ = ',';             p = s_u2s(p, e, app->consumed_today_ml);
+        *p++ = ',';             p = s_u2s(p, e, app->hydration_score);
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&app->ble, out); return;
+    }
+
+    /* ---- LED control ---- */
+    if (strcmp(up, "RED") == 0)   { WS2812B_SetAll(RGB_RED);   WS2812B_SendBlocking(); BLE_SendStr(&app->ble, "OK\r\n"); return; }
+    if (strcmp(up, "GREEN") == 0) { WS2812B_SetAll(RGB_GREEN); WS2812B_SendBlocking(); BLE_SendStr(&app->ble, "OK\r\n"); return; }
+    if (strcmp(up, "BLUE") == 0)  { WS2812B_SetAll(RGB_BLUE);  WS2812B_SendBlocking(); BLE_SendStr(&app->ble, "OK\r\n"); return; }
+    if (strcmp(up, "WHITE") == 0) { WS2812B_SetAll(RGB(255,255,255)); WS2812B_SendBlocking(); BLE_SendStr(&app->ble, "OK\r\n"); return; }
+    if (strcmp(up, "OFF") == 0)   { WS2812B_SetAll(RGB_OFF);   WS2812B_SendBlocking(); BLE_SendStr(&app->ble, "OK\r\n"); return; }
+
+    if (strcmp(up, "RGB") == 0) {
+        int v[3];
+        if (s_csv(line, v, 3) == 3 &&
+            v[0]>=0 && v[0]<=255 && v[1]>=0 && v[1]<=255 && v[2]>=0 && v[2]<=255) {
+            WS2812B_SetAll(RGB((uint8_t)v[0], (uint8_t)v[1], (uint8_t)v[2]));
+            WS2812B_SendBlocking();
+            BLE_SendStr(&app->ble, "OK\r\n");
+        } else BLE_SendStr(&app->ble, "ERR rgb\r\n");
+        return;
+    }
+
+    if (strcmp(up, "LAMP") == 0) {
+        int v[3];
+        if (s_csv(line, v, 3) == 3 &&
+            v[0]>=0 && v[0]<=255 && v[1]>=0 && v[1]<=255 && v[2]>=0 && v[2]<=255) {
+            WS2812B_SetLampColor(RGB((uint8_t)v[0], (uint8_t)v[1], (uint8_t)v[2]));
+            WS2812B_SetPattern(LED_PATTERN_LAMP_MODE);
+            BLE_SendStr(&app->ble, "OK\r\n");
+        } else BLE_SendStr(&app->ble, "ERR lamp\r\n");
+        return;
+    }
+
+    /* ---- Buzzer ---- */
+    if (strcmp(up, "BEEP") == 0) { Buzzer_Play(BUZZER_SINGLE_BEEP); BLE_SendStr(&app->ble, "OK\r\n"); return; }
+    if (strcmp(up, "BON")  == 0) { Buzzer_Play(BUZZER_DOUBLE_BEEP); BLE_SendStr(&app->ble, "OK\r\n"); return; }
+    if (strcmp(up, "BOFF") == 0) { Buzzer_Stop();                   BLE_SendStr(&app->ble, "OK\r\n"); return; }
+
+    /* ---- Calibration (empty-bottle tare) ---- */
+    if (strcmp(up, "CAL") == 0 || strcmp(up, "TARE") == 0) {
+        BLE_Packet_t fake;          /* reuse existing calibration handler */
+        fake.cmd = BLE_CMD_CALIBRATION;
+        fake.len = 1;
+        fake.payload[0] = 0;        /* stage 0 = empty_bottle */
+        App_Cmd_Calibration(app, &fake);
+        BLE_SendStr(&app->ble, "OK cal\r\n");
+        return;
+    }
+
+    BLE_SendStr(&app->ble, "ERR unknown\r\n");
 }
 
 /* ─── Individual command handlers ───────────────────────────── */
