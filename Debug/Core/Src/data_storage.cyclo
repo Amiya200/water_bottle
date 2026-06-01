@@ -1,0 +1,17 @@
+../Core/Src/data_storage.c:19:26:Flash_WriteBytes.isra	4
+../Core/Src/data_storage.c:6:26:Flash_ErasePage.isra	1
+../Core/Src/data_storage.c:40:10:Storage_CRC32	3
+../Core/Src/data_storage.c:52:6:Storage_DefaultPrefs	1
+../Core/Src/data_storage.c:69:6:Storage_Init	1
+../Core/Src/data_storage.c:72:6:Storage_LoadSettings	2
+../Core/Src/data_storage.c:85:6:Storage_SaveSettings	1
+../Core/Src/data_storage.c:97:6:Storage_EraseSettings	1
+../Core/Src/data_storage.c:103:6:Storage_AddDrinkEvent	2
+../Core/Src/data_storage.c:114:6:Storage_FlushDrinkLog	2
+../Core/Src/data_storage.c:123:6:Storage_LoadDrinkLog	2
+../Core/Src/data_storage.c:130:6:Storage_MarkSynced	3
+../Core/Src/data_storage.c:139:6:Storage_UpdateDailySummary	8
+../Core/Src/data_storage.c:178:6:Storage_FlushDailySummary	2
+../Core/Src/data_storage.c:187:6:Storage_LoadDailySummary	2
+../Core/Src/data_storage.c:195:6:Storage_PurgeDailySummaryOlderThan	3
+../Core/Src/data_storage.c:206:6:Storage_FactoryReset	1

@@ -1,0 +1,8 @@
+../Core/Src/bma253.c:12:26:BMA253_ReadRegs	2
+../Core/Src/bma253.c:4:26:BMA253_WriteReg.isra	1
+../Core/Src/bma253.c:21:19:BMA253_SoftReset	1
+../Core/Src/bma253.c:28:19:BMA253_Init	12
+../Core/Src/bma253.c:71:19:BMA253_ReadAccel	2
+../Core/Src/bma253.c:88:6:BMA253_MotionISR	1
+../Core/Src/bma253.c:93:9:BMA253_PopMotionFlag	2
+../Core/Src/bma253.c:102:19:BMA253_SetSuspend	1

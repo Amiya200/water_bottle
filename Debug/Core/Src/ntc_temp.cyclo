@@ -1,0 +1,4 @@
+../Core/Src/ntc_temp.c:118:6:NTC_Init	1
+../Core/Src/ntc_temp.c:130:9:NTC_ReadTemp_x10	12
+../Core/Src/ntc_temp.c:209:7:NTC_GetTempCelsius	1
+../Core/Src/ntc_temp.c:218:9:NTC_IsAboveThreshold	2

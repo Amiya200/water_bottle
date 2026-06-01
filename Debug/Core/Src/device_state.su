@@ -1,0 +1,6 @@
+../Core/Src/device_state.c:5:13:OnEnterState	16	static
+../Core/Src/device_state.c:51:6:Device_Init	8	static
+../Core/Src/device_state.c:64:6:Device_SetInitialState	8	static
+../Core/Src/device_state.c:69:6:Device_PostEvent	0	static
+../Core/Src/device_state.c:74:6:Device_Run	8	static
+../Core/Src/device_state.c:145:15:Device_GetState	0	static

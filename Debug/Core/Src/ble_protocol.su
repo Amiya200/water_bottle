@@ -1,0 +1,9 @@
+../Core/Src/ble_protocol.c:14:9:BLE_ParsePacket	24	static
+../Core/Src/ble_protocol.c:39:9:BLE_BuildPacket	24	static
+../Core/Src/ble_protocol.c:53:9:BLE_BuildACK	16	static
+../Core/Src/ble_protocol.c:60:9:BLE_BuildPong	8	static
+../Core/Src/ble_protocol.c:65:9:BLE_BuildStatus	16	static
+../Core/Src/ble_protocol.c:71:9:BLE_BuildLogEntry	8	static
+../Core/Src/ble_protocol.c:78:9:BLE_BuildDaily	8	static
+../Core/Src/ble_protocol.c:85:9:BLE_BuildConfig	8	static
+../Core/Src/ble_protocol.c:92:9:BLE_BuildLive	8	static

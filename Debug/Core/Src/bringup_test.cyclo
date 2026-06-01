@@ -1,0 +1,6 @@
+../Core/Src/bringup_test.c:53:13:BringUp_ReadNTC	2
+../Core/Src/bringup_test.c:63:13:BringUp_ReadTDS	1
+../Core/Src/bringup_test.c:72:13:BringUp_ReadHX711	2
+../Core/Src/bringup_test.c:90:6:BringUp_Init	1
+../Core/Src/bringup_test.c:111:6:BringUp_RunOnce	1
+../Core/Src/bringup_test.c:145:6:BringUp_RunLoop	5
