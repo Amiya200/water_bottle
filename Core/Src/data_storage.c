@@ -1,8 +1,9 @@
 #pragma GCC optimize("Os")
+#include "main.h"           /* HAL types, FLASH_EraseInitTypeDef, HAL_OK, etc. */
 #include "data_storage.h"
 #include <string.h>
 
-/* ─── Flash page helpers ────────────────────────────────────── */
+/* ─── Flash page helpers ─────────────────────────────────────────────────── */
 static HAL_StatusTypeDef Flash_ErasePage(uint32_t page_addr)
 {
     FLASH_EraseInitTypeDef erase = {0};
@@ -36,7 +37,7 @@ static void Flash_ReadBytes(uint32_t addr, uint8_t *out, uint32_t len)
     memcpy(out, (const void *)addr, len);
 }
 
-/* ─── CRC32 (software, polynomial 0xEDB88320) ──────────────── */
+/* ─── CRC32 (software, polynomial 0xEDB88320) ───────────────────────────── */
 uint32_t Storage_CRC32(const uint8_t *data, uint16_t len)
 {
     uint32_t crc = 0xFFFFFFFFUL;
@@ -48,27 +49,24 @@ uint32_t Storage_CRC32(const uint8_t *data, uint16_t len)
     return ~crc;
 }
 
-/* ─── Default preferences ───────────────────────────────────── */
+/* ─── Default preferences ────────────────────────────────────────────────── */
 void Storage_DefaultPrefs(BLE_PrefsPayload_t *p)
 {
-    /* purity goal: 500 ppm */
-    p->purity_goal_hi = 0x01; p->purity_goal_lo = 0xF4;
-    /* temp goal: 40.0°C → 400 × 10 → 0x0190 */
-    p->temp_goal_hi = 0x01; p->temp_goal_lo = 0x90;
-    /* hydration: 2000 ml → 0x07D0 */
-    p->hydration_hi = 0x07; p->hydration_lo = 0xD0;
-    p->remind_h_start  = 8;   p->remind_m_start = 0;
-    p->remind_h_end    = 20;  p->remind_m_end   = 0;
+    p->purity_goal_hi  = 0x01; p->purity_goal_lo  = 0xF4;  /* 500 ppm      */
+    p->temp_goal_hi    = 0x01; p->temp_goal_lo    = 0x90;  /* 40.0 °C      */
+    p->hydration_hi    = 0x07; p->hydration_lo    = 0xD0;  /* 2000 ml      */
+    p->remind_h_start  = 8;    p->remind_m_start  = 0;
+    p->remind_h_end    = 20;   p->remind_m_end    = 0;
     p->remind_freq_min = 60;
-    p->remind_r = 0;  p->remind_g = 255; p->remind_b = 0;  /* green */
-    p->remind_sound = 2;   /* double_beep */
-    p->lamp_r = 255; p->lamp_g = 255; p->lamp_b = 255;    /* white */
+    p->remind_r        = 0;    p->remind_g        = 255;   p->remind_b = 0;
+    p->remind_sound    = 2;    /* double_beep */
+    p->lamp_r          = 255;  p->lamp_g          = 255;   p->lamp_b   = 255;
 }
 
-/* ─── Init ──────────────────────────────────────────────────── */
+/* ─── Init ───────────────────────────────────────────────────────────────── */
 void Storage_Init(void) { /* flash always readable, nothing to do */ }
 
-/* ─── Settings ──────────────────────────────────────────────── */
+/* ─── Settings ───────────────────────────────────────────────────────────── */
 void Storage_LoadSettings(DeviceSettings_t *out)
 {
     Flash_ReadBytes(STORAGE_SETTINGS_ADDR, (uint8_t *)out, sizeof(DeviceSettings_t));
@@ -99,10 +97,11 @@ void Storage_EraseSettings(void)
     Flash_ErasePage(STORAGE_SETTINGS_ADDR);
 }
 
-/* ─── Drink log ─────────────────────────────────────────────── */
+/* ─── Drink log ──────────────────────────────────────────────────────────── */
 void Storage_AddDrinkEvent(DrinkLog_t *log, const DrinkEvent_t *ev)
 {
     if (log->count >= STORAGE_MAX_DRINK_EVENTS) {
+        /* Oldest-first eviction: shift all events down by one */
         memmove(&log->events[0], &log->events[1],
                 sizeof(DrinkEvent_t) * (STORAGE_MAX_DRINK_EVENTS - 1U));
         log->count = STORAGE_MAX_DRINK_EVENTS - 1U;
@@ -135,15 +134,20 @@ void Storage_MarkSynced(DrinkLog_t *log, uint32_t synced_up_to_unix)
     log->dirty = 1;
 }
 
-/* ─── Daily summary ─────────────────────────────────────────── */
+/* ─── Daily summary ──────────────────────────────────────────────────────── */
 void Storage_UpdateDailySummary(DailySummaryLog_t *daily,
-                                 DrinkLog_t *log,
-                                 uint32_t today_unix)
+                                 DrinkLog_t        *log,
+                                 uint32_t           today_unix)
 {
     uint32_t midnight = (today_unix / 86400UL) * 86400UL;
-    int8_t today_idx = -1;
-    for (uint8_t i = 0; i < daily->count; i++)
-        if (daily->days[i].date_unix == midnight) { today_idx = (int8_t)i; break; }
+    int8_t   today_idx = -1;
+
+    for (uint8_t i = 0; i < daily->count; i++) {
+        if (daily->days[i].date_unix == midnight) {
+            today_idx = (int8_t)i;
+            break;
+        }
+    }
 
     if (today_idx < 0) {
         if (daily->count >= STORAGE_MAX_DAILY_DAYS) {
@@ -159,18 +163,20 @@ void Storage_UpdateDailySummary(DailySummaryLog_t *daily,
 
     uint32_t total_ml = 0, sum_ppm = 0;
     int32_t  sum_temp = 0;
-    uint16_t cnt = 0;
+    uint16_t cnt      = 0;
+
     for (uint8_t i = 0; i < log->count; i++) {
         if (log->events[i].unix_time >= midnight &&
             log->events[i].unix_time <  midnight + 86400UL) {
             total_ml += log->events[i].volume_ml;
             sum_ppm  += log->events[i].purity_ppm;
-            sum_temp += log->events[i].temp_x10;
+            sum_temp += log->events[i].temp_x10;   /* int16_t as defined */
             cnt++;
         }
     }
+
     daily->days[today_idx].total_ml       = (uint16_t)total_ml;
-    daily->days[today_idx].avg_purity_ppm = cnt ? (uint16_t)(sum_ppm / cnt) : 0U;
+    daily->days[today_idx].avg_purity_ppm = cnt ? (uint16_t)(sum_ppm / cnt)  : 0U;
     daily->days[today_idx].avg_temp_x10   = cnt ? (int16_t)(sum_temp / cnt) : 0;
     daily->dirty = 1;
 }
@@ -193,7 +199,7 @@ void Storage_LoadDailySummary(DailySummaryLog_t *daily)
 }
 
 void Storage_PurgeDailySummaryOlderThan(DailySummaryLog_t *daily,
-                                          uint32_t cutoff_unix)
+                                         uint32_t           cutoff_unix)
 {
     uint8_t new_count = 0;
     for (uint8_t i = 0; i < daily->count; i++)

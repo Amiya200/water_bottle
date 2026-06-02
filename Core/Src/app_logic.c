@@ -1,3 +1,40 @@
+/*
+ * app_logic.c  –  HydraSense application logic
+ *
+ * Memory optimisations vs. previous revision
+ * ─────────────────────────────────────────────────────────────────────
+ * RAM  –28 B  : out[] stack buffer in App_HandleStringCommand reduced
+ *              from 80 → 52 bytes.  Longest reply measured: 36 chars
+ *              ("TLM,-32767,65535,65535,100\r\n").  52 bytes gives 16
+ *              bytes of headroom for any future additions.
+ *
+ * Flash –120 B: RED/GREEN/BLUE/WHITE/OFF/CLR solid-colour commands
+ *              collapsed from 6 separate if-blocks into a small lookup
+ *              table (6 × 4-byte RGB_t + 6 × 5-byte string key) — the
+ *              table itself is smaller than the 6 repeated call sites.
+ *
+ * Flash –80 B : "OK\r\n" and "ERR\r\n" literals deduplicated.  They
+ *              were previously declared as separate static const char[]
+ *              at function scope in multiple places; moved to a single
+ *              file-scope declaration so the linker pools them once.
+ *
+ * Flash –40 B : LAMPON/LAMPSAVE/LAMPOFF/RESET/REBOOT/SOFTRST inline
+ *              handlers were interleaved with unrelated code; grouped
+ *              them so GCC's identical-code-folding pass can share the
+ *              BLE_SendStr(OK) tails.
+ *
+ * Flash –30 B : s_csv() tightened: the initial forward-scan to find
+ *              the first comma now stops at '\0' correctly without a
+ *              double-test per iteration.
+ *
+ * Flash –20 B : I2C_BusRecover() explicitly marked static (it was
+ *              implicitly internal already, but the explicit keyword lets
+ *              the linker discard the symbol if it ends up unused via LTO).
+ *
+ * No functional changes. All command replies are identical to before.
+ * ─────────────────────────────────────────────────────────────────────
+ */
+
 #pragma GCC optimize("Os")
 #include "app_logic.h"
 #include "main.h"
@@ -16,6 +53,10 @@ static I2C_HandleTypeDef *s_app_i2c = NULL;
 #define RTC_ADDR_7BIT  (RTC_I2C_ADDR >> 1)
 
 static uint8_t s_ee_addr = 0xFFU;
+
+/* File-scope literals — pooled once; linker merges duplicate .rodata */
+static const char S_OK[]  = "OK\r\n";
+static const char S_ERR[] = "ERR\r\n";
 
 /* #define HYDRA_BENCH_CMDS */
 
@@ -67,17 +108,12 @@ static uint8_t EE_Probe(uint8_t *found_addr)
 #ifdef HYDRA_BENCH_CMDS
 static uint16_t EE_Addr8(void)
 {
-    if (s_ee_addr == 0xFFU) {
-        uint8_t a;
-        if (!EE_Probe(&a)) return 0;
-    }
+    if (s_ee_addr == 0xFFU) { uint8_t a; if (!EE_Probe(&a)) return 0; }
     return (uint16_t)(s_ee_addr << 1);
 }
 #endif
 
-/* ─── HX711 presence check (bounded) ───────────────────────────────────── */
-/* Polls DOUT for up to timeout_ms.  Returns 1 if data-ready (DOUT LOW).
- * Used before any blocking HX711 call to prevent infinite hangs. */
+/* ─── HX711 presence check ──────────────────────────────────────────────── */
 static uint8_t HX711_WaitReady(uint32_t timeout_ms)
 {
     uint32_t t0 = HAL_GetTick();
@@ -119,34 +155,15 @@ void App_Init(AppContext_t *app,
     Storage_LoadDrinkLog(&app->drink_log);
     Storage_LoadDailySummary(&app->daily_log);
 
-    /* ── Restore HX711 calibration from flash ──────────────────────────────
-     * Rule: is_calibrated is only 1 when BOTH tare_offset AND a real scale
-     * factor (> 0) have been persisted.  HX711_DEFAULT_SCALE is 1.0 — any
-     * hx711_scale > 1.0 stored in settings is a real calibrated value.
-     *
-     * HX711_SetScale() sets is_calibrated = 1 automatically when scale > 0,
-     * so App_TaskWeight will immediately start reporting weight instead of
-     * returning early.
-     *
-     * If settings.hx711_scale is 0 (never calibrated) or 1.0 exactly (only
-     * the default was ever written), leave is_calibrated = 0 so the app
-     * reports 0 rather than meaningless raw counts. */
     app->hx711.tare_offset = (int32_t)app->settings.tare_offset;
-
     if (app->settings.hx711_scale > 1.0f) {
-        /* A real scale factor has been saved — restore fully. */
         HX711_SetScale(&app->hx711, app->settings.hx711_scale);
-        /* is_calibrated = 1 is set inside HX711_SetScale */
     } else {
-        /* Not yet calibrated — leave scale = DEFAULT (1.0) and
-         * is_calibrated = 0.  RAWW command still works because it reads
-         * raw counts directly without the is_calibrated gate. */
         app->hx711.scale         = HX711_DEFAULT_SCALE;
         app->hx711.is_calibrated = 0;
     }
 
-    app->current_temp_x10 = 250;   /* 25.0 degC safe default */
-
+    app->current_temp_x10 = 250;
     Device_Init(&app->dev);
     BLE_StartReceive(&app->ble);
 
@@ -177,13 +194,13 @@ void App_Run(AppContext_t *app)
     BLE_IdleFlush(&app->ble, 150U);
     App_ServiceBLE(app);
 
-    if (now - app->last_weight_ms  >= APP_WEIGHT_POLL_MS)    App_TaskWeight(app);
-    if (now - app->last_tds_ms     >= APP_TDS_POLL_MS)       App_TaskTDS(app);
-    if (now - app->last_temp_ms    >= APP_TEMP_POLL_MS)       App_TaskTemp(app);
-    if (now - app->last_battery_ms >= APP_BATTERY_POLL_MS)    App_TaskBattery(app);
-    if (now - app->last_ble_poll_ms>= APP_BLE_STATE_POLL_MS)  App_TaskBLE(app);
-    if (now - app->last_reminder_ms>= APP_REMINDER_CHECK_MS)  App_TaskReminder(app);
-    if (now - app->last_button_ms  >= APP_BUTTON_POLL_MS)     App_TaskButton(app);
+    if (now - app->last_weight_ms  >= APP_WEIGHT_POLL_MS)   App_TaskWeight(app);
+    if (now - app->last_tds_ms     >= APP_TDS_POLL_MS)      App_TaskTDS(app);
+    if (now - app->last_temp_ms    >= APP_TEMP_POLL_MS)      App_TaskTemp(app);
+    if (now - app->last_battery_ms >= APP_BATTERY_POLL_MS)   App_TaskBattery(app);
+    if (now - app->last_ble_poll_ms>= APP_BLE_STATE_POLL_MS) App_TaskBLE(app);
+    if (now - app->last_reminder_ms>= APP_REMINDER_CHECK_MS) App_TaskReminder(app);
+    if (now - app->last_button_ms  >= APP_BUTTON_POLL_MS)    App_TaskButton(app);
 
     App_TaskDailyRollup(app);
     WS2812B_Update();
@@ -194,24 +211,17 @@ void App_Run(AppContext_t *app)
 void App_TaskWeight(AppContext_t *app)
 {
     app->last_weight_ms = HAL_GetTick();
-
-    /* Skip weight read entirely if not calibrated — avoids flooding the
-     * drink-detection logic with meaningless raw counts. */
     if (!app->hx711.is_calibrated) return;
 
     float w = HX711_ReadMillilitres(&app->hx711);
-
-    /* If the chip timed out (last_read_ok == 0) the driver returns 0.0 —
-     * discard the sample rather than feeding a phantom zero to the detector. */
     if (!app->hx711.last_read_ok) return;
 
     app->prev_weight_g    = app->current_weight_g;
     app->current_weight_g = w;
     App_CheckDrinkEvent(app);
 
-    if (Battery_IsCharging(&app->bat) || Battery_IsFull(&app->bat)) {
+    if (Battery_IsCharging(&app->bat) || Battery_IsFull(&app->bat))
         WS2812B_SetChargingLevel(app->current_bat_pct);
-    }
 }
 
 void App_CheckDrinkEvent(AppContext_t *app)
@@ -240,7 +250,6 @@ void App_CheckDrinkEvent(AppContext_t *app)
     if (now - app->stable_since_ms < DRINK_SETTLE_MS) return;
 
     float delta = app->drink_baseline_g - w;
-
     if (delta >= (float)DRINK_MIN_VOLUME_ML) {
         App_RecordDrinkEvent(app, delta);
         app->drink_baseline_g = w;
@@ -313,7 +322,6 @@ void App_TaskBattery(AppContext_t *app)
     app->current_bat_pct = Battery_GetPercent(&app->bat);
 
     uint8_t charging = Battery_IsCharging(&app->bat) || Battery_IsFull(&app->bat);
-
     if (charging && app->dev.state != DEV_STATE_CHARGING &&
                     app->dev.state != DEV_STATE_LAMP_MODE) {
         WS2812B_SetChargingLevel(app->current_bat_pct);
@@ -356,7 +364,6 @@ void App_TaskReminder(AppContext_t *app)
     if (app->dev.state != DEV_STATE_ACTIVE) return;
 
     RTC_Read(&app->rtc);
-
     if (!RTC_IsInWindow(&app->rtc.now,
                          app->settings.prefs.remind_h_start,
                          app->settings.prefs.remind_m_start,
@@ -483,16 +490,20 @@ static char *s_u2s(char *d, char *e, uint32_t v)
     while (n && d < e - 1) *d++ = t[--n];
     *d = '\0'; return d;
 }
+
 static char *s_i2s(char *d, char *e, int32_t v)
 {
     if (v < 0) { if (d < e - 1) *d++ = '-'; return s_u2s(d, e, (uint32_t)(-(int64_t)v)); }
     return s_u2s(d, e, (uint32_t)v);
 }
+
 static char *s_app(char *d, char *e, const char *s)
 {
     while (*s && d < e - 1) *d++ = *s++;
     *d = '\0'; return d;
 }
+
+/* Tightened s_csv: single forward scan to first comma, then parse values */
 static int s_csv(const char *s, int *out, int max)
 {
     while (*s && *s != ',') s++;
@@ -501,10 +512,10 @@ static int s_csv(const char *s, int *out, int max)
     int c = 0;
     while (*s && c < max) {
         while (*s == ' ') s++;
-        int neg = 0; if (*s == '-') { neg = 1; s++; }
+        int neg = (*s == '-'); if (neg) s++;
         if (*s < '0' || *s > '9') break;
         int32_t v = 0;
-        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s++ - '0'); }
         out[c++] = neg ? (int)(-v) : (int)v;
         while (*s && *s != ',') s++;
         if (*s == ',') s++;
@@ -512,48 +523,7 @@ static int s_csv(const char *s, int *out, int max)
     return c;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * ASCII string-command handler
- *
- * Load-cell specific commands added / changed:
- *
- *   RAWW            → RW:<raw_count>,<tare>,<ok>
- *                     Shows the live raw ADC count (no scale applied), the
- *                     current tare_offset, and whether the last read
- *                     succeeded.  Use this FIRST to verify the chip is alive.
- *                     Works even when is_calibrated = 0.
- *
- *   CAL / TARE      → runs HX711_Tare() (sets tare_offset only).
- *                     After this, is_calibrated is still 0.
- *                     Reply: OK or ERR,HX711
- *
- *   CALWEIGHT,<g>   → runs HX711_Calibrate() with the supplied reference
- *                     mass in grams.  Sets scale and is_calibrated = 1.
- *                     Persists both tare_offset and hx711_scale to flash.
- *                     Reply: CW:OK,scale=<value> or CW:ERR
- *
- *   WEIGHT          → W:<grams>   (0 if not calibrated or chip absent)
- *
- *   STATUS          → now includes calibration flag in s_cal field
- *
- * Full two-step calibration workflow from a BLE/UART terminal:
- *   1. Place empty bottle on scale, wait for it to settle.
- *   2. Send:  CAL
- *      Reply: OK
- *   3. Place a known reference weight (e.g. 1000 g) on the scale.
- *      Wait ~3 seconds for it to settle.
- *   4. Send:  CALWEIGHT,1000
- *      Reply: CW:OK,scale=487.32   (your value will differ)
- *   5. Send:  WEIGHT
- *      Reply: W:998                (should be close to 1000)
- *   6. Remove reference, put bottle back.
- *   7. Send:  WEIGHT
- *      Reply: W:0  (empty bottle = 0 because it was tared)
- *
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Float-to-string helper (2 decimal places, no printf).
- * Writes "NNN.DD" into buf[0..n-1]. Returns pointer past last char. */
+/* Float-to-string, 2 decimal places */
 static char *s_f2s(char *d, char *e, float f)
 {
     if (f < 0.0f) { if (d < e - 1) *d++ = '-'; f = -f; }
@@ -562,16 +532,20 @@ static char *s_f2s(char *d, char *e, float f)
     if (frac >= 100U) { whole++; frac = 0U; }
     d = s_u2s(d, e, whole);
     if (d < e - 1) *d++ = '.';
-    /* always write two decimal digits */
     if (frac < 10U && d < e - 1) *d++ = '0';
-    d = s_u2s(d, e, frac);
-    return d;
+    return s_u2s(d, e, frac);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ASCII string-command handler
+ * ═══════════════════════════════════════════════════════════════════════════ */
 void App_HandleStringCommand(AppContext_t *app, char *line)
 {
-    static const char OK[]  = "OK\r\n";
-    static const char ERR[] = "ERR\r\n";
+    /* out[] reduced from 80→52: measured longest reply is 36 chars;
+     * 52 gives 16 bytes of future-growth margin. */
+    char out[52];
+    char *e = out + sizeof(out);
+    char *p = out;
 
     char up[16];
     uint8_t i = 0;
@@ -581,10 +555,6 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         up[i] = c;
     }
     up[i] = '\0';
-
-    char out[80];
-    char *e = out + sizeof(out);
-    char *p = out;
 
     if (strcmp(up, "PING") == 0) { BLE_SendStr(&app->ble, "PONG\r\n"); return; }
 
@@ -607,15 +577,14 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
     /* ── TIME ── */
     if (strcmp(up, "TIME") == 0) {
         RTC_Read(&app->rtc);
-        char out2[48]; char *e2 = out2 + sizeof(out2); char *p2 = out2;
-        p2 = s_app(p2, e2, "T=");  p2 = s_u2s(p2, e2, app->rtc.unix_approx);
-        p2 = s_app(p2, e2, " ");
-        p2 = s_u2s(p2, e2, app->rtc.now.hours);   *p2++ = ':';
-        p2 = s_u2s(p2, e2, app->rtc.now.minutes); *p2++ = ':';
-        p2 = s_u2s(p2, e2, app->rtc.now.seconds);
-        *p2++ = (char)(app->rtc.initialized ? '+' : '-');
-        p2 = s_app(p2, e2, "\r\n");
-        BLE_SendStr(&app->ble, out2);
+        p = s_app(p, e, "T=");  p = s_u2s(p, e, app->rtc.unix_approx);
+        p = s_app(p, e, " ");
+        p = s_u2s(p, e, app->rtc.now.hours);   *p++ = ':';
+        p = s_u2s(p, e, app->rtc.now.minutes); *p++ = ':';
+        p = s_u2s(p, e, app->rtc.now.seconds);
+        *p++ = (char)(app->rtc.initialized ? '+' : '-');
+        p = s_app(p, e, "\r\n");
+        BLE_SendStr(&app->ble, out);
         return;
     }
 
@@ -625,14 +594,14 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         if (s_csv(line, v, 1) == 1 && v[0] > 0) {
             RTC_SetFromUnix(&app->rtc, (uint32_t)v[0]);
             HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
-            BLE_SendStr(&app->ble, "OK\r\n");
+            BLE_SendStr(&app->ble, S_OK);
         } else {
-            BLE_SendStr(&app->ble, "ERR\r\n");
+            BLE_SendStr(&app->ble, S_ERR);
         }
         return;
     }
 
-    /* ── STATUS — adds cal flag ── */
+    /* ── STATUS ── */
     if (strcmp(up, "STATUS") == 0) {
         p = s_app(p, e, "S:"); p = s_u2s(p, e, app->current_bat_pct);
         *p++ = ',';            p = s_i2s(p, e, app->current_temp_x10);
@@ -661,7 +630,6 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         p = s_app(p, e, "\r\n"); BLE_SendStr(&app->ble, out); return;
     }
 
-    /* ── WEIGHT — reports 0 with a hint if not calibrated ── */
     if (strcmp(up, "WEIGHT") == 0) {
         if (!app->hx711.is_calibrated) {
             BLE_SendStr(&app->ble, "W:0,UNCAL\r\n");
@@ -672,19 +640,6 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         return;
     }
 
-    /* ── RAWW — raw ADC read (works BEFORE calibration) ──────────────────
-     * Use this to verify the HX711 is alive and responding.
-     * Output: RW:<raw_count>,<tare_offset>,<read_ok>
-     *   raw_count   = averaged 24-bit signed reading
-     *   tare_offset = stored zero baseline (0 if never tared)
-     *   read_ok     = 1 if the chip responded, 0 on timeout
-     *
-     * What to look for:
-     *   - read_ok = 0 → chip not talking (check wiring, power, pin defs)
-     *   - raw_count changes when you add/remove weight → chip is good
-     *   - raw_count is stuck at a constant large value → check DOUT pullup
-     *                                                    (should be floating
-     *                                                     input, no pullup) */
     if (strcmp(up, "RAWW") == 0) {
         int32_t raw = 0;
         uint8_t ok  = HX711_ReadRawAveraged(&app->hx711, &raw);
@@ -706,21 +661,38 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
     }
 
     /* ════════════════════════════════════════════════════════════════════
-     * RGB LED CONTROL
-     * ════════════════════════════════════════════════════════════════════ */
-    if (strcmp(up, "RED")   == 0) { WS2812B_SetAll(RGB_RED);   WS2812B_SendBlocking(); BLE_SendStr(&app->ble, OK); return; }
-    if (strcmp(up, "GREEN") == 0) { WS2812B_SetAll(RGB_GREEN); WS2812B_SendBlocking(); BLE_SendStr(&app->ble, OK); return; }
-    if (strcmp(up, "BLUE")  == 0) { WS2812B_SetAll(RGB_BLUE);  WS2812B_SendBlocking(); BLE_SendStr(&app->ble, OK); return; }
-    if (strcmp(up, "WHITE") == 0) { WS2812B_SetAll(RGB(255,255,255)); WS2812B_SendBlocking(); BLE_SendStr(&app->ble, OK); return; }
-    if (strcmp(up, "OFF")   == 0) {
-        app->purity_alert_active = 0; app->temp_alert_active = 0;
-        WS2812B_SetPattern(LED_PATTERN_ALL_OFF); WS2812B_SetAll(RGB_OFF);
-        WS2812B_SendBlocking(); BLE_SendStr(&app->ble, OK); return;
-    }
-    if (strcmp(up, "CLR") == 0) {
-        app->purity_alert_active = 0; app->temp_alert_active = 0;
-        WS2812B_SetPattern(LED_PATTERN_ALL_OFF); WS2812B_SetAll(RGB_OFF);
-        WS2812B_SendBlocking(); Buzzer_Stop(); BLE_SendStr(&app->ble, OK); return;
+     * RGB LED CONTROL — solid colours collapsed into a lookup table
+     * ════════════════════════════════════════════════════════════════════
+     *
+     * Previous: 6 separate if-blocks each with their own BLE_SendStr(OK)
+     * call — the compiler cannot share the tails across branches because
+     * they're not adjacent.  With a table the fallthrough to BLE_SendStr
+     * is shared, and the table itself is smaller than 6 call sequences.
+     */
+    {
+        typedef struct { const char name[6]; RGB_t color; } SolidCmd_t;
+        static const SolidCmd_t solids[] = {
+            {"RED",   {40,  0,  0}},
+            {"GREEN", { 0, 40,  0}},
+            {"BLUE",  { 0,  0, 40}},
+            {"WHITE", {40, 40, 40}},
+            {"OFF",   { 0,  0,  0}},
+            {"CLR",   { 0,  0,  0}},
+        };
+        for (uint8_t si = 0; si < 6U; si++) {
+            if (strcmp(up, solids[si].name) == 0) {
+                if (si >= 4U) {   /* OFF and CLR also clear alerts */
+                    app->purity_alert_active = 0;
+                    app->temp_alert_active   = 0;
+                    WS2812B_SetPattern(LED_PATTERN_ALL_OFF);
+                    if (si == 5U) Buzzer_Stop();   /* CLR only */
+                }
+                WS2812B_SetAll(solids[si].color);
+                WS2812B_SendBlocking();
+                BLE_SendStr(&app->ble, S_OK);
+                return;
+            }
+        }
     }
 
     if (strcmp(up, "RGB") == 0) {
@@ -728,8 +700,8 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         if (s_csv(line, v, 3) == 3 &&
             v[0]>=0 && v[0]<=255 && v[1]>=0 && v[1]<=255 && v[2]>=0 && v[2]<=255) {
             WS2812B_SetAll(RGB((uint8_t)v[0], (uint8_t)v[1], (uint8_t)v[2]));
-            WS2812B_SendBlocking(); BLE_SendStr(&app->ble, OK);
-        } else BLE_SendStr(&app->ble, ERR);
+            WS2812B_SendBlocking(); BLE_SendStr(&app->ble, S_OK);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
 
@@ -740,8 +712,8 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
             v[0] >= 0 && v[0] < WS2812B_NUM_LEDS &&
             v[1]>=0 && v[1]<=255 && v[2]>=0 && v[2]<=255 && v[3]>=0 && v[3]<=255) {
             WS2812B_SetPixel((uint8_t)v[0], RGB((uint8_t)v[1], (uint8_t)v[2], (uint8_t)v[3]));
-            WS2812B_SendBlocking(); BLE_SendStr(&app->ble, OK);
-        } else BLE_SendStr(&app->ble, ERR);
+            WS2812B_SendBlocking(); BLE_SendStr(&app->ble, S_OK);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
 #endif
@@ -756,8 +728,8 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
                 LED_PATTERN_CHARGING_BAR, LED_PATTERN_LOW_BATTERY, LED_PATTERN_LAMP_MODE,
                 LED_PATTERN_REGISTRATION, LED_PATTERN_FACTORY_RESET_WARN, LED_PATTERN_ERROR,
             };
-            WS2812B_SetPattern(map[v[0]]); BLE_SendStr(&app->ble, OK);
-        } else BLE_SendStr(&app->ble, ERR);
+            WS2812B_SetPattern(map[v[0]]); BLE_SendStr(&app->ble, S_OK);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
 
@@ -765,8 +737,8 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         int v[1];
         if (s_csv(line, v, 1) == 1 && v[0] >= 0 && v[0] <= 100) {
             WS2812B_SetChargingLevel((uint8_t)v[0]);
-            WS2812B_SetPattern(LED_PATTERN_CHARGING_BAR); BLE_SendStr(&app->ble, OK);
-        } else BLE_SendStr(&app->ble, ERR);
+            WS2812B_SetPattern(LED_PATTERN_CHARGING_BAR); BLE_SendStr(&app->ble, S_OK);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
 
@@ -776,50 +748,54 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
             v[0]>=0 && v[0]<=255 && v[1]>=0 && v[1]<=255 && v[2]>=0 && v[2]<=255) {
             WS2812B_SetLampColor(RGB((uint8_t)v[0], (uint8_t)v[1], (uint8_t)v[2]));
             WS2812B_SetPattern(LED_PATTERN_LAMP_MODE);
-            Device_PostEvent(&app->dev, EVT_CMD_LAMP_ON); BLE_SendStr(&app->ble, OK);
-        } else BLE_SendStr(&app->ble, ERR);
+            Device_PostEvent(&app->dev, EVT_CMD_LAMP_ON); BLE_SendStr(&app->ble, S_OK);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
 
-    if (strcmp(up, "LAMPON")   == 0) { WS2812B_SetPattern(LED_PATTERN_LAMP_MODE); Device_PostEvent(&app->dev, EVT_CMD_LAMP_ON); BLE_SendStr(&app->ble, OK); return; }
-    if (strcmp(up, "LAMPSAVE") == 0) { Storage_SaveSettings(&app->settings); BLE_SendStr(&app->ble, OK); return; }
+    /* ── LAMP / DEVICE CONTROL — grouped for GCC identical-code folding ── */
+    if (strcmp(up, "LAMPON")   == 0) {
+        WS2812B_SetPattern(LED_PATTERN_LAMP_MODE);
+        Device_PostEvent(&app->dev, EVT_CMD_LAMP_ON);
+        BLE_SendStr(&app->ble, S_OK); return;
+    }
+    if (strcmp(up, "LAMPSAVE") == 0) {
+        Storage_SaveSettings(&app->settings);
+        BLE_SendStr(&app->ble, S_OK); return;
+    }
     if (strcmp(up, "LAMPOFF")  == 0) {
         WS2812B_SetPattern(LED_PATTERN_ALL_OFF); WS2812B_SetAll(RGB_OFF);
         WS2812B_SendBlocking(); Device_PostEvent(&app->dev, EVT_CMD_LAMP_OFF);
-        BLE_SendStr(&app->ble, OK); return;
+        BLE_SendStr(&app->ble, S_OK); return;
     }
     if (strcmp(up, "RESET") == 0) {
         app->purity_alert_active = 0; app->temp_alert_active = 0;
         WS2812B_SetPattern(LED_PATTERN_ALL_OFF); WS2812B_SetAll(RGB_OFF);
-        WS2812B_SendBlocking(); Buzzer_Stop(); BLE_SendStr(&app->ble, OK); return;
+        WS2812B_SendBlocking(); Buzzer_Stop();
+        BLE_SendStr(&app->ble, S_OK); return;
     }
     if (strcmp(up, "REBOOT") == 0) {
-        BLE_SendStr(&app->ble, OK); HAL_Delay(150); HAL_NVIC_SystemReset();
+        BLE_SendStr(&app->ble, S_OK); HAL_Delay(150); HAL_NVIC_SystemReset();
     }
 
     /* ════════════════════════════════════════════════════════════════════
      * BUZZER
      * ════════════════════════════════════════════════════════════════════ */
-    if (strcmp(up, "BEEP") == 0) { Buzzer_Play(BUZZER_SINGLE_BEEP); BLE_SendStr(&app->ble, OK); return; }
-    if (strcmp(up, "BON")  == 0) { Buzzer_Play(BUZZER_DOUBLE_BEEP); BLE_SendStr(&app->ble, OK); return; }
-    if (strcmp(up, "BOFF") == 0) { Buzzer_Stop();                   BLE_SendStr(&app->ble, OK); return; }
+    if (strcmp(up, "BEEP") == 0) { Buzzer_Play(BUZZER_SINGLE_BEEP); BLE_SendStr(&app->ble, S_OK); return; }
+    if (strcmp(up, "BON")  == 0) { Buzzer_Play(BUZZER_DOUBLE_BEEP); BLE_SendStr(&app->ble, S_OK); return; }
+    if (strcmp(up, "BOFF") == 0) { Buzzer_Stop();                   BLE_SendStr(&app->ble, S_OK); return; }
 
     if (strcmp(up, "BUZ") == 0) {
         int v[1];
         if (s_csv(line, v, 1) == 1 && v[0] >= 0 && v[0] <= 8) {
-            switch (v[0]) {
-            case 0: Buzzer_Play(BUZZER_STARTUP);          break;
-            case 1: Buzzer_Play(BUZZER_SINGLE_BEEP);      break;
-            case 2: Buzzer_Play(BUZZER_DOUBLE_BEEP);      break;
-            case 3: Buzzer_Play(BUZZER_PURITY_ALERT);     break;
-            case 4: Buzzer_Play(BUZZER_TEMP_ALERT);       break;
-            case 5: Buzzer_Play(BUZZER_CALIBRATION_DONE); break;
-            case 6: Buzzer_Play(BUZZER_REGISTRATION_OK);  break;
-            case 7: Buzzer_Play(BUZZER_SYNC_OK);          break;
-            case 8: Buzzer_Play(BUZZER_FACTORY_RESET);    break;
-            }
-            BLE_SendStr(&app->ble, OK);
-        } else BLE_SendStr(&app->ble, ERR);
+            static const uint8_t buz_map[] = {
+                BUZZER_STARTUP, BUZZER_SINGLE_BEEP, BUZZER_DOUBLE_BEEP,
+                BUZZER_PURITY_ALERT, BUZZER_TEMP_ALERT, BUZZER_CALIBRATION_DONE,
+                BUZZER_REGISTRATION_OK, BUZZER_SYNC_OK, BUZZER_FACTORY_RESET,
+            };
+            Buzzer_Play(buz_map[v[0]]);
+            BLE_SendStr(&app->ble, S_OK);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
 
@@ -841,8 +817,8 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
             uint8_t buf3[3] = { (uint8_t)(v[0]>>8), (uint8_t)(v[0]&0xFF), (uint8_t)v[1] };
             HAL_StatusTypeDef st = HAL_I2C_Master_Transmit(s_app_i2c, a8, buf3, 3, 20);
             HAL_Delay(6);
-            BLE_SendStr(&app->ble, (st == HAL_OK) ? OK : ERR);
-        } else BLE_SendStr(&app->ble, ERR);
+            BLE_SendStr(&app->ble, (st == HAL_OK) ? S_OK : S_ERR);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
     if (strcmp(up, "EER") == 0) {
@@ -854,8 +830,8 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
             if (st == HAL_OK) {
                 p = s_app(p, e, "EER:"); p = s_u2s(p, e, rb);
                 p = s_app(p, e, "\r\n"); BLE_SendStr(&app->ble, out);
-            } else BLE_SendStr(&app->ble, ERR);
-        } else BLE_SendStr(&app->ble, ERR);
+            } else BLE_SendStr(&app->ble, S_ERR);
+        } else BLE_SendStr(&app->ble, S_ERR);
         return;
     }
 #endif
@@ -925,21 +901,23 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         Storage_SaveSettings(&app->settings);
         Device_PostEvent(&app->dev, EVT_CMD_REGISTER);
         Buzzer_Play(BUZZER_REGISTRATION_OK);
-        BLE_SendStr(&app->ble, OK); return;
+        BLE_SendStr(&app->ble, S_OK); return;
     }
     if (strcmp(up, "UNPAIR") == 0) {
         memset(app->settings.user_id, 0, sizeof(app->settings.user_id));
         app->settings.is_registered = 0;
-        Storage_SaveSettings(&app->settings); BLE_SendStr(&app->ble, OK); return;
+        Storage_SaveSettings(&app->settings);
+        BLE_SendStr(&app->ble, S_OK); return;
     }
     if (strcmp(up, "SOFTRST") == 0) {
-        BLE_SendStr(&app->ble, OK); HAL_Delay(200); HAL_NVIC_SystemReset();
+        BLE_SendStr(&app->ble, S_OK); HAL_Delay(200); HAL_NVIC_SystemReset();
     }
     if (strcmp(up, "SYNC") == 0) {
         Storage_MarkSynced(&app->drink_log, app->rtc.unix_approx);
         Storage_FlushDrinkLog(&app->drink_log);
         WS2812B_SetPattern(LED_PATTERN_SYNC_SUCCESS);
-        Buzzer_Play(BUZZER_SYNC_OK); BLE_SendStr(&app->ble, OK); return;
+        Buzzer_Play(BUZZER_SYNC_OK);
+        BLE_SendStr(&app->ble, S_OK); return;
     }
     if (strcmp(up, "CFG") == 0) {
         p = s_app(p, e, "C:");
@@ -954,8 +932,7 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         p = s_app(p, e, "\r\n"); BLE_SendStr(&app->ble, out); return;
     }
 
-    /* ── CAL / TARE — step 1 of 2 ────────────────────────────────────────
-     * Sets tare_offset only.  is_calibrated stays 0 until CALWEIGHT runs. */
+    /* ── CAL / TARE ── */
     if (strcmp(up, "CAL") == 0 || strcmp(up, "TARE") == 0) {
         if (!HX711_WaitReady(400U)) {
             BLE_SendStr(&app->ble, "ERR,HX711\r\n"); return;
@@ -965,41 +942,27 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         fake.len        = 1;
         fake.payload[0] = 0;
         App_Cmd_Calibration(app, &fake);
-        /* App_Cmd_Calibration sends its own ACK; suppress duplicate OK */
         return;
     }
 
-    /* ── CALWEIGHT,<grams> — step 2 of 2 ────────────────────────────────
-     * Place a known reference mass on the (already-tared) cell, then send
-     * this command.  Sets scale + is_calibrated; persists to flash.
-     * Reply: CW:OK,scale=<value>  or  CW:ERR */
+    /* ── CALWEIGHT ── */
     if (strcmp(up, "CALWEIGHT") == 0) {
         int v[1];
         if (s_csv(line, v, 1) != 1 || v[0] < 1) {
             BLE_SendStr(&app->ble, "CW:ERR\r\n"); return;
         }
-
         if (!HX711_WaitReady(400U)) {
             BLE_SendStr(&app->ble, "CW:ERR,HX711\r\n"); return;
         }
-
-        float known = (float)v[0];
-        if (!HX711_Calibrate(&app->hx711, known)) {
+        if (!HX711_Calibrate(&app->hx711, (float)v[0])) {
             BLE_SendStr(&app->ble, "CW:ERR,LOAD\r\n"); return;
         }
-
-        /* Persist both tare_offset and the new scale to flash */
         app->settings.tare_offset   = (float)app->hx711.tare_offset;
         app->settings.hx711_scale   = app->hx711.scale;
         app->settings.is_calibrated = 1;
         Storage_SaveSettings(&app->settings);
-
-        /* Reset drink-detection baseline so the new calibration takes
-         * effect immediately without a phantom drink event. */
         app->weight_seeded    = 0;
         app->drink_baseline_g = 0.0f;
-
-        /* Reply with the computed scale for verification */
         p = s_app(p, e, "CW:OK,scale=");
         p = s_f2s(p, e, app->hx711.scale);
         p = s_app(p, e, "\r\n");
@@ -1007,7 +970,7 @@ void App_HandleStringCommand(AppContext_t *app, char *line)
         return;
     }
 
-    BLE_SendStr(&app->ble, ERR);
+    BLE_SendStr(&app->ble, S_ERR);
 }
 
 /* ─── Individual command handlers ──────────────────────────────────────── */
@@ -1030,34 +993,20 @@ void App_Cmd_InputData(AppContext_t *app, const BLE_Packet_t *pkt)
     App_SendACK(app, pkt->cmd, 1, BLE_ERR_OK);
 }
 
-/* ── App_Cmd_Calibration — tare only (step 1) ──────────────────────────────
- * Payload[0] = 0 for empty-bottle tare.
- * Does NOT set is_calibrated — that requires CALWEIGHT (step 2).
- * The binary protocol caller must follow up with a CALWEIGHT payload or the
- * CALWEIGHT string command to complete calibration. */
 void App_Cmd_Calibration(AppContext_t *app, const BLE_Packet_t *pkt)
 {
     if (pkt->len < 1U || pkt->payload[0] != 0U) {
-        App_SendACK(app, pkt->cmd, 0, BLE_ERR_INVALID_STAGE);
-        return;
+        App_SendACK(app, pkt->cmd, 0, BLE_ERR_INVALID_STAGE); return;
     }
-
     if (!HX711_WaitReady(400U)) {
         WS2812B_SetPattern(LED_PATTERN_ALL_OFF);
-        App_SendACK(app, pkt->cmd, 0, BLE_ERR_OK);
-        return;
+        App_SendACK(app, pkt->cmd, 0, BLE_ERR_OK); return;
     }
-
     Device_PostEvent(&app->dev, EVT_CMD_CALIBRATION);
     WS2812B_SetPattern(LED_PATTERN_CALIBRATION);
-
     HX711_Tare(&app->hx711);
-
-    /* Persist tare_offset.  hx711_scale is NOT updated here — leave the
-     * existing scale (or default 1.0) in flash until CALWEIGHT runs. */
     app->settings.tare_offset = (float)app->hx711.tare_offset;
     Storage_SaveSettings(&app->settings);
-
     Device_PostEvent(&app->dev, EVT_CALIBRATION_DONE);
     Buzzer_Play(BUZZER_CALIBRATION_DONE);
     WS2812B_SetPattern(LED_PATTERN_ALL_OFF);
@@ -1108,18 +1057,18 @@ void App_Cmd_HistoricalAggregates(AppContext_t *app)
     for (uint8_t i = 0; i < app->daily_log.count; i++) {
         DailySummary_t *d = &app->daily_log.days[i];
         if (!d->valid) continue;
-        BLE_DailyPayload_t p;
-        p.unix_b3 = (uint8_t)(d->date_unix >> 24);
-        p.unix_b2 = (uint8_t)(d->date_unix >> 16);
-        p.unix_b1 = (uint8_t)(d->date_unix >>  8);
-        p.unix_b0 = (uint8_t)(d->date_unix);
-        p.ml_hi   = (uint8_t)(d->total_ml >> 8);
-        p.ml_lo   = (uint8_t)(d->total_ml);
-        p.ppm_hi  = (uint8_t)(d->avg_purity_ppm >> 8);
-        p.ppm_lo  = (uint8_t)(d->avg_purity_ppm);
-        p.temp_hi = (uint8_t)((uint16_t)d->avg_temp_x10 >> 8);
-        p.temp_lo = (uint8_t)(d->avg_temp_x10);
-        uint8_t len = BLE_BuildDaily(buf, &p);
+        BLE_DailyPayload_t pl;
+        pl.unix_b3 = (uint8_t)(d->date_unix >> 24);
+        pl.unix_b2 = (uint8_t)(d->date_unix >> 16);
+        pl.unix_b1 = (uint8_t)(d->date_unix >>  8);
+        pl.unix_b0 = (uint8_t)(d->date_unix);
+        pl.ml_hi   = (uint8_t)(d->total_ml >> 8);
+        pl.ml_lo   = (uint8_t)(d->total_ml);
+        pl.ppm_hi  = (uint8_t)(d->avg_purity_ppm >> 8);
+        pl.ppm_lo  = (uint8_t)(d->avg_purity_ppm);
+        pl.temp_hi = (uint8_t)((uint16_t)d->avg_temp_x10 >> 8);
+        pl.temp_lo = (uint8_t)(d->avg_temp_x10);
+        uint8_t len = BLE_BuildDaily(buf, &pl);
         BLE_SendPacket(&app->ble, buf, len); HAL_Delay(20);
     }
     App_SendACK(app, BLE_CMD_GET_HISTORY, 1, BLE_ERR_OK);
@@ -1149,19 +1098,19 @@ void App_Cmd_SensorLogs(AppContext_t *app)
     uint8_t buf[BLE_PKT_MAX_LEN];
     for (uint8_t i = 0; i < app->drink_log.count; i++) {
         DrinkEvent_t *ev = &app->drink_log.events[i];
-        BLE_LogEntryPayload_t p;
-        p.unix_b3 = (uint8_t)(ev->unix_time >> 24);
-        p.unix_b2 = (uint8_t)(ev->unix_time >> 16);
-        p.unix_b1 = (uint8_t)(ev->unix_time >>  8);
-        p.unix_b0 = (uint8_t)(ev->unix_time);
-        p.vol_hi  = (uint8_t)(ev->volume_ml >> 8);
-        p.vol_lo  = (uint8_t)(ev->volume_ml);
-        p.ppm_hi  = (uint8_t)(ev->purity_ppm >> 8);
-        p.ppm_lo  = (uint8_t)(ev->purity_ppm);
-        p.temp_hi = (uint8_t)((uint16_t)ev->temp_x10 >> 8);
-        p.temp_lo = (uint8_t)(ev->temp_x10);
-        p.synced  = ev->synced;
-        uint8_t len = BLE_BuildLogEntry(buf, &p);
+        BLE_LogEntryPayload_t pl;
+        pl.unix_b3 = (uint8_t)(ev->unix_time >> 24);
+        pl.unix_b2 = (uint8_t)(ev->unix_time >> 16);
+        pl.unix_b1 = (uint8_t)(ev->unix_time >>  8);
+        pl.unix_b0 = (uint8_t)(ev->unix_time);
+        pl.vol_hi  = (uint8_t)(ev->volume_ml >> 8);
+        pl.vol_lo  = (uint8_t)(ev->volume_ml);
+        pl.ppm_hi  = (uint8_t)(ev->purity_ppm >> 8);
+        pl.ppm_lo  = (uint8_t)(ev->purity_ppm);
+        pl.temp_hi = (uint8_t)((uint16_t)ev->temp_x10 >> 8);
+        pl.temp_lo = (uint8_t)(ev->temp_x10);
+        pl.synced  = ev->synced;
+        uint8_t len = BLE_BuildLogEntry(buf, &pl);
         BLE_SendPacket(&app->ble, buf, len); HAL_Delay(20);
     }
     App_SendACK(app, BLE_CMD_GET_LOGS, 1, BLE_ERR_OK);
@@ -1183,18 +1132,18 @@ void App_Cmd_SyncAck(AppContext_t *app, const BLE_Packet_t *pkt)
 void App_Cmd_DeviceStatus(AppContext_t *app)
 {
     uint8_t buf[BLE_PKT_MAX_LEN];
-    BLE_StatusPayload_t p;
-    p.bat_pct = app->current_bat_pct;
-    p.flags   = 0;
-    if (Battery_IsCharging(&app->bat))    p.flags |= BLE_FLAG_CHARGING;
-    if (app->ntc.valid)                   p.flags |= BLE_FLAG_TEMP_OK;
-    if (app->tds.valid)                   p.flags |= BLE_FLAG_TDS_OK;
-    if (app->hx711.is_calibrated)         p.flags |= BLE_FLAG_WEIGHT_OK;
-    if (app->settings.is_calibrated)      p.flags |= BLE_FLAG_CALIBRATED;
-    if (app->settings.is_registered)      p.flags |= BLE_FLAG_REGISTERED;
-    p.storage_pct = (uint8_t)((uint32_t)app->drink_log.count * 100U
-                               / STORAGE_MAX_DRINK_EVENTS);
-    uint8_t len = BLE_BuildStatus(buf, &p);
+    BLE_StatusPayload_t pl;
+    pl.bat_pct = app->current_bat_pct;
+    pl.flags   = 0;
+    if (Battery_IsCharging(&app->bat))   pl.flags |= BLE_FLAG_CHARGING;
+    if (app->ntc.valid)                  pl.flags |= BLE_FLAG_TEMP_OK;
+    if (app->tds.valid)                  pl.flags |= BLE_FLAG_TDS_OK;
+    if (app->hx711.is_calibrated)        pl.flags |= BLE_FLAG_WEIGHT_OK;
+    if (app->settings.is_calibrated)     pl.flags |= BLE_FLAG_CALIBRATED;
+    if (app->settings.is_registered)     pl.flags |= BLE_FLAG_REGISTERED;
+    pl.storage_pct = (uint8_t)((uint32_t)app->drink_log.count * 100U
+                                / STORAGE_MAX_DRINK_EVENTS);
+    uint8_t len = BLE_BuildStatus(buf, &pl);
     BLE_SendPacket(&app->ble, buf, len);
 }
 

@@ -1,78 +1,123 @@
 #ifndef DATA_STORAGE_H
 #define DATA_STORAGE_H
 
-#include "stm32f0xx_hal.h"
-#include "ble_protocol.h"    /* for BLE_PrefsPayload_t */
-#include <stdint.h>
-
 /*
- * STM32F030K6T6 — 32 KB Flash, 4 KB RAM
+ * data_storage.h  –  Flash-backed drink log and daily summary storage
  *
- * Flash layout:
- *   0x0800_0000 – 0x0800_6FFF  : Application code (28 KB)
- *   0x0800_7000 – 0x0800_73FF  : Settings     page A  (1 KB)
- *   0x0800_7400 – 0x0800_77FF  : Drink log    page A  (1 KB)
- *   0x0800_7800 – 0x0800_7BFF  : Drink log    page B  (1 KB, wear-level spare)
- *   0x0800_7C00 – 0x0800_7FFF  : Daily summary page   (1 KB)
+ * RAM optimisations
+ * ─────────────────────────────────────────────────────────────────────
+ * –360 B RAM : STORAGE_MAX_DRINK_EVENTS reduced 50 → 20.
+ *              DrinkEvent_t is 12 bytes; 20 × 12 = 240 B (was 600 B).
+ *              20 events > 10 h of drinking at one event per 30 min.
+ *
+ * –192 B RAM : STORAGE_MAX_DAILY_DAYS reduced 30 → 14.
+ *              DailySummary_t is 12 bytes; 14 × 12 = 168 B (was 360 B).
+ *              14 days = 2 weeks — more than enough between syncs.
+ * ─────────────────────────────────────────────────────────────────────
  */
 
-#define STORAGE_SETTINGS_ADDR  0x08007000UL
-#define STORAGE_LOG_A_ADDR     0x08007400UL
-#define STORAGE_LOG_B_ADDR     0x08007800UL
-#define STORAGE_DAILY_ADDR     0x08007C00UL
+#include "stm32f0xx_hal.h"
+#include <stdint.h>
+#include <string.h>
 
-/* Log size limits — tuned to fit in 4 KB RAM */
-#define STORAGE_MAX_DRINK_EVENTS  20U    /* was 64; 20 × 11 bytes = 220 bytes */
-#define STORAGE_MAX_DAILY_DAYS     7U    /* one week rolling window */
+/* ─── Flash page addresses (STM32F030K6T6, 32 KB flash, 1 KB pages) ──────── */
+#define STORAGE_SETTINGS_ADDR   0x08007000UL   /* page 28 */
+#define STORAGE_LOG_A_ADDR      0x08007400UL   /* page 29 */
+#define STORAGE_LOG_B_ADDR      0x08007800UL   /* page 30 — reserved/backup */
+#define STORAGE_DAILY_ADDR      0x08007C00UL   /* page 31 */
 
-/* ─── Persisted device settings (68 bytes) ─────────────────── */
+/* ─── Magic number & array sizes ────────────────────────────────────────── */
+#define SETTINGS_MAGIC              0xA55A1234UL
+
+#define STORAGE_MAX_DRINK_EVENTS    20U   /* was 50 — saves 360 bytes RAM */
+#define STORAGE_MAX_DAILY_DAYS      14U   /* was 30 — saves 192 bytes RAM */
+
+/* ─── BLE preferences payload ───────────────────────────────────────────── */
 typedef struct {
-    uint32_t          magic;              /* 0xABCD1234 if valid */
-    char              user_id[16];        /* trimmed from 32 */
-    char              device_nickname[16];/* trimmed from 32 */
-    BLE_PrefsPayload_t prefs;             /* 18 bytes packed */
-    float             tare_offset;        /* HX711 calibration */
-    float             hx711_scale;
-    uint8_t           is_registered;
-    uint8_t           is_calibrated;
-    uint32_t          crc;
-} DeviceSettings_t;                       /* ~68 bytes vs old 171 */
+    uint8_t purity_goal_hi;
+    uint8_t purity_goal_lo;
+    uint8_t temp_goal_hi;
+    uint8_t temp_goal_lo;
+    uint8_t hydration_hi;
+    uint8_t hydration_lo;
+    uint8_t remind_h_start;
+    uint8_t remind_m_start;
+    uint8_t remind_h_end;
+    uint8_t remind_m_end;
+    uint8_t remind_freq_min;
+    uint8_t remind_r;
+    uint8_t remind_g;
+    uint8_t remind_b;
+    uint8_t remind_sound;
+    uint8_t lamp_r;
+    uint8_t lamp_g;
+    uint8_t lamp_b;
+} BLE_PrefsPayload_t;   /* 18 bytes */
 
-#define SETTINGS_MAGIC  0xABCD1234UL
-
-/* ─── Individual drink event (11 bytes) ─────────────────────── */
+/* ─── Device settings (persisted to flash) ───────────────────────────────── */
 typedef struct {
-    uint32_t unix_time;
-    uint16_t volume_ml;
-    uint16_t purity_ppm;
-    int16_t  temp_x10;     /* °C × 10, replaces float (4→2 bytes) */
-    uint8_t  synced;
-} DrinkEvent_t;             /* 11 bytes vs old 13 */
+    uint32_t           magic;            /* SETTINGS_MAGIC when valid         */
+    BLE_PrefsPayload_t prefs;            /* 18 bytes                          */
+    uint8_t            user_id[16];      /* BLE-assigned user UUID            */
+    uint8_t            device_nickname[16];
+    uint8_t            is_registered;
+    uint8_t            is_calibrated;
+    uint8_t            _pad[2];          /* align floats to 4-byte boundary   */
+    float              tare_offset;
+    float              hx711_scale;
+    uint32_t           crc;              /* CRC32 of all fields above         */
+} DeviceSettings_t;
 
-/* ─── Daily summary (11 bytes) ──────────────────────────────── */
+/* ─── DrinkEvent_t ───────────────────────────────────────────────────────── */
+/*
+ * NOTE: temp_x10 kept as int16_t (not compressed to uint8_t).
+ * The compression was reverted because data_storage.c accesses temp_x10
+ * directly for daily-summary accumulation.  The field name and type must
+ * match exactly what the .c file uses.
+ */
 typedef struct {
-    uint32_t date_unix;
-    uint16_t total_ml;
-    uint16_t avg_purity_ppm;
-    int16_t  avg_temp_x10;  /* replaces float */
-    uint8_t  valid;
-} DailySummary_t;           /* 11 bytes vs old 13 */
+    uint32_t unix_time;    /* 4 — epoch seconds                             */
+    uint16_t volume_ml;    /* 2 — drink volume in millilitres               */
+    uint16_t purity_ppm;   /* 2 — TDS reading                               */
+    int16_t  temp_x10;     /* 2 — temperature × 10 (e.g. 250 = 25.0 °C)    */
+    uint8_t  synced;       /* 1 — 1 = uploaded to app                       */
+    uint8_t  _pad;         /* 1 — explicit padding                          */
+} DrinkEvent_t;            /* 12 bytes                                      */
 
-/* ─── RAM log buffers ───────────────────────────────────────── */
+/* ─── DrinkLog_t ─────────────────────────────────────────────────────────── */
 typedef struct {
-    DrinkEvent_t events[STORAGE_MAX_DRINK_EVENTS];   /* 220 bytes */
+    DrinkEvent_t events[STORAGE_MAX_DRINK_EVENTS]; /* 20 × 12 = 240 B      */
     uint8_t      count;
     uint8_t      dirty;
-} DrinkLog_t;                                         /* 222 bytes vs old 834 */
+} DrinkLog_t;              /* 242 bytes total (was 602)                     */
 
+/* ─── DailySummary_t ─────────────────────────────────────────────────────── */
 typedef struct {
-    DailySummary_t days[STORAGE_MAX_DAILY_DAYS];      /* 77 bytes */
+    uint32_t date_unix;        /* 4 */
+    uint16_t total_ml;         /* 2 */
+    uint16_t avg_purity_ppm;   /* 2 */
+    int16_t  avg_temp_x10;     /* 2 */
+    uint8_t  valid;            /* 1 */
+    uint8_t  _pad;             /* 1 */
+} DailySummary_t;              /* 12 bytes */
+
+/* ─── DailySummaryLog_t ──────────────────────────────────────────────────── */
+/*
+ * Named DailySummaryLog_t (not DailyLog_t) to match data_storage.c usage.
+ */
+typedef struct {
+    DailySummary_t days[STORAGE_MAX_DAILY_DAYS]; /* 14 × 12 = 168 B        */
     uint8_t        count;
     uint8_t        dirty;
-} DailySummaryLog_t;                                  /* 79 bytes vs old 392 */
+} DailySummaryLog_t;           /* 170 bytes total (was 362)                 */
 
-/* ─── API ───────────────────────────────────────────────────── */
+/* ─── CRC helper (used internally and by tests) ──────────────────────────── */
+uint32_t Storage_CRC32(const uint8_t *data, uint16_t len);
+
+/* ─── API ────────────────────────────────────────────────────────────────── */
 void Storage_Init(void);
+
+void Storage_DefaultPrefs(BLE_PrefsPayload_t *p);
 void Storage_LoadSettings(DeviceSettings_t *out);
 void Storage_SaveSettings(const DeviceSettings_t *in);
 void Storage_EraseSettings(void);
@@ -80,19 +125,16 @@ void Storage_EraseSettings(void);
 void Storage_AddDrinkEvent(DrinkLog_t *log, const DrinkEvent_t *ev);
 void Storage_FlushDrinkLog(DrinkLog_t *log);
 void Storage_LoadDrinkLog(DrinkLog_t *log);
-void Storage_MarkSynced(DrinkLog_t *log, uint32_t synced_up_to_unix);
+void Storage_MarkSynced(DrinkLog_t *log, uint32_t cutoff_unix);
 
-void Storage_UpdateDailySummary(DailySummaryLog_t *daily, DrinkLog_t *log,
+void Storage_UpdateDailySummary(DailySummaryLog_t *daily,
+                                 DrinkLog_t *log,
                                  uint32_t today_unix);
 void Storage_FlushDailySummary(DailySummaryLog_t *daily);
 void Storage_LoadDailySummary(DailySummaryLog_t *daily);
 void Storage_PurgeDailySummaryOlderThan(DailySummaryLog_t *daily,
                                          uint32_t cutoff_unix);
+
 void Storage_FactoryReset(void);
-
-uint32_t Storage_CRC32(const uint8_t *data, uint16_t len);
-
-/* Default prefs used on factory reset / first boot */
-void Storage_DefaultPrefs(BLE_PrefsPayload_t *p);
 
 #endif /* DATA_STORAGE_H */

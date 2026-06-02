@@ -1,38 +1,3 @@
-/*
- * bringup_test.c  –  HydraSense hardware bring-up / self-test
- *
- * Enable with -DBRINGUP_TEST_MODE (Project Properties → C/C++ Build →
- * Settings → MCU GCC Compiler → Preprocessor → Defined symbols).
- *
- * Probes each core subsystem before the full app stack:
- *   1. WS2812B RGB ring  (PA8 / TIM1_CH1 + DMA)    ← via WS2812B_SelfTest()
- *   2. NTC temperature   (PA3 / ADC_IN3)
- *   3. TDS sensor        (PA2 / ADC_IN2, drive PA6)
- *   4. HX711 load cell   (PA4 DOUT / PA5 SCK)
- *
- * Add 'g_test' to STM32CubeIDE → Live Expressions (Window → Show View →
- * Live Expressions) to watch every field update live over SWD.
- *
- * ==========================================================================
- * RGB test details
- * ==========================================================================
- * BringUp_RunOnce() calls WS2812B_SelfTest() which runs the SAME 8-phase
- * colour-walk proven in the standalone ws2812.c test build:
- *
- *   Phase 1  ALL RED    800 ms   GRB wire = 0x00 0x28 0x00 per LED
- *   Phase 2  ALL GREEN  800 ms   GRB wire = 0x28 0x00 0x00 per LED
- *   Phase 3  ALL BLUE   800 ms   GRB wire = 0x00 0x00 0x28 per LED
- *   Phase 4  ALL WHITE  800 ms   GRB wire = 0x28 0x28 0x28 per LED
- *   Phase 5  RAINBOW    1200 ms  10 unique hues, LED01..LED10
- *   Phase 6  ALTERNATE  800 ms   even=RED / odd=GREEN
- *   Phase 7  PIXEL WALK 120 ms per position × 10 positions
- *   Phase 8  ALL OFF    300 ms
- *
- * g_test.rgb_send_count increments each time WS2812B_SelfTest() sends a
- * frame. A stuck value means the DMA never completed.
- * g_test.rgb_busy mirrors ws2812b_busy — should pulse 0→1→0 each frame.
- * g_test.rgb_status = TEST_PASS if send_count > 0 after the test.
- */
 
 #include "bringup_test.h"
 #include "ws2812b.h"
