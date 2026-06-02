@@ -2,35 +2,56 @@
 #include "rtc_manager.h"
 #include <string.h>
 
-/* Shared days-per-month table (non-leap year) — used by both
- * RTC_SetFromUnix and RTC_ToUnix to avoid two copies in flash. */
-static const uint8_t s_days_in_month[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+/* ============================================================================
+ * PCF8563 real-time clock driver  (schematic U10, I2C1 @ 0x51)
+ *
+ * Replaces the earlier DS3231 implementation, which targeted the wrong chip
+ * (DS3231 lives at 0x68 with a different register map, so it never ACKed and
+ *  every timestamp came back as zero).
+ *
+ * 1 Hz tick: the PCF8563 has no DS3231-style 1 Hz SQW. We use its countdown
+ * timer programmed to 1 Hz / count 1 with timer-interrupt enabled, which
+ * pulses INT# (wired to PA11/RTC_INT) once per second.
+ * ==========================================================================*/
 
-/* DS3231 register addresses */
-#define DS3231_REG_SECONDS  0x00U
-#define DS3231_REG_MINUTES  0x01U
-#define DS3231_REG_HOURS    0x02U
-#define DS3231_REG_DAY      0x03U
-#define DS3231_REG_DATE     0x04U
-#define DS3231_REG_MONTH    0x05U
-#define DS3231_REG_YEAR     0x06U
-#define DS3231_REG_CONTROL  0x0EU
-#define DS3231_REG_STATUS   0x0FU
+/* PCF8563 register addresses */
+#define PCF_REG_CTRL1     0x00U   /* control/status 1                    */
+#define PCF_REG_CTRL2     0x01U   /* control/status 2 (TIE/AIE/TF/AF)    */
+#define PCF_REG_VL_SEC    0x02U   /* bit7 = VL (clock-integrity lost)    */
+#define PCF_REG_MINUTES   0x03U
+#define PCF_REG_HOURS     0x04U
+#define PCF_REG_DAYS      0x05U
+#define PCF_REG_WEEKDAYS  0x06U
+#define PCF_REG_MONTHS    0x07U   /* bit7 = century                      */
+#define PCF_REG_YEARS     0x08U
+#define PCF_REG_TIMER_CTL 0x0EU   /* timer control                       */
+#define PCF_REG_TIMER     0x0FU   /* timer countdown value               */
+
+/* CTRL2 bits */
+#define PCF_CTRL2_TIE     0x01U   /* timer interrupt enable              */
+#define PCF_CTRL2_TF      0x04U   /* timer flag (write 0 to clear)       */
+
+/* TIMER_CTL bits */
+#define PCF_TIMER_ENABLE  0x80U
+#define PCF_TIMER_1HZ     0x02U   /* source clock = 1 Hz                 */
+
+/* Shared days-per-month table (non-leap year). */
+static const uint8_t s_days_in_month[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
 
 /* BCD helpers */
 static uint8_t BCD2DEC(uint8_t b) { return (uint8_t)((b >> 4) * 10U + (b & 0x0FU)); }
 static uint8_t DEC2BCD(uint8_t d) { return (uint8_t)(((d / 10U) << 4) | (d % 10U)); }
 
-static HAL_StatusTypeDef DS3231_ReadRegs(I2C_HandleTypeDef *hi2c,
-                                          uint8_t reg, uint8_t *buf, uint8_t len)
+static HAL_StatusTypeDef PCF_ReadRegs(I2C_HandleTypeDef *hi2c,
+                                       uint8_t reg, uint8_t *buf, uint8_t len)
 {
     HAL_StatusTypeDef s = HAL_I2C_Master_Transmit(hi2c, RTC_I2C_ADDR, &reg, 1, RTC_TIMEOUT_MS);
     if (s != HAL_OK) return s;
     return HAL_I2C_Master_Receive(hi2c, RTC_I2C_ADDR, buf, len, RTC_TIMEOUT_MS);
 }
 
-static HAL_StatusTypeDef DS3231_WriteRegs(I2C_HandleTypeDef *hi2c,
-                                           uint8_t reg, const uint8_t *buf, uint8_t len)
+static HAL_StatusTypeDef PCF_WriteRegs(I2C_HandleTypeDef *hi2c,
+                                        uint8_t reg, const uint8_t *buf, uint8_t len)
 {
     uint8_t tx[16];
     tx[0] = reg;
@@ -46,15 +67,19 @@ HAL_StatusTypeDef RTC_Init(RTC_Handle_t *hrtc, I2C_HandleTypeDef *hi2c)
     hrtc->initialized = 0;
     memset(&hrtc->now, 0, sizeof(hrtc->now));
 
-    /* 1 Hz square wave output (INTCN=0, RS[1:0]=00) */
-    uint8_t ctrl = 0x00U;
-    if (DS3231_WriteRegs(hi2c, DS3231_REG_CONTROL, &ctrl, 1) != HAL_OK) return HAL_ERROR;
+    /* CTRL1 = 0x00 : normal mode, oscillator running. */
+    uint8_t ctrl1 = 0x00U;
+    if (PCF_WriteRegs(hi2c, PCF_REG_CTRL1, &ctrl1, 1) != HAL_OK) return HAL_ERROR;
 
-    /* Clear OSF in status register */
-    uint8_t status = 0;
-    DS3231_ReadRegs(hi2c, DS3231_REG_STATUS, &status, 1);
-    status &= ~0x80U;
-    DS3231_WriteRegs(hi2c, DS3231_REG_STATUS, &status, 1);
+    /* CTRL2 = TIE : enable timer interrupt on INT#, clear any pending flag. */
+    uint8_t ctrl2 = PCF_CTRL2_TIE;
+    if (PCF_WriteRegs(hi2c, PCF_REG_CTRL2, &ctrl2, 1) != HAL_OK) return HAL_ERROR;
+
+    /* Timer = 1 count, source 1 Hz, enabled  -> INT# pulses once per second. */
+    uint8_t tval = 1U;
+    PCF_WriteRegs(hi2c, PCF_REG_TIMER, &tval, 1);
+    uint8_t tctl = PCF_TIMER_ENABLE | PCF_TIMER_1HZ;
+    PCF_WriteRegs(hi2c, PCF_REG_TIMER_CTL, &tctl, 1);
 
     hrtc->initialized = 1;
     return RTC_Read(hrtc);
@@ -62,15 +87,15 @@ HAL_StatusTypeDef RTC_Init(RTC_Handle_t *hrtc, I2C_HandleTypeDef *hi2c)
 
 HAL_StatusTypeDef RTC_Read(RTC_Handle_t *hrtc)
 {
-    uint8_t raw[7];
-    if (DS3231_ReadRegs(hrtc->hi2c, DS3231_REG_SECONDS, raw, 7) != HAL_OK) return HAL_ERROR;
+    uint8_t raw[7];   /* regs 0x02..0x08 */
+    if (PCF_ReadRegs(hrtc->hi2c, PCF_REG_VL_SEC, raw, 7) != HAL_OK) return HAL_ERROR;
 
-    hrtc->now.seconds = BCD2DEC(raw[0] & 0x7FU);
+    hrtc->now.seconds = BCD2DEC(raw[0] & 0x7FU);   /* mask VL bit          */
     hrtc->now.minutes = BCD2DEC(raw[1] & 0x7FU);
     hrtc->now.hours   = BCD2DEC(raw[2] & 0x3FU);
-    hrtc->now.day     = BCD2DEC(raw[3] & 0x07U);
-    hrtc->now.date    = BCD2DEC(raw[4] & 0x3FU);
-    hrtc->now.month   = BCD2DEC(raw[5] & 0x1FU);
+    hrtc->now.date    = BCD2DEC(raw[3] & 0x3FU);   /* days                 */
+    hrtc->now.day     = BCD2DEC(raw[4] & 0x07U);   /* weekday              */
+    hrtc->now.month   = BCD2DEC(raw[5] & 0x1FU);   /* months (mask century)*/
     hrtc->now.year    = BCD2DEC(raw[6]);
 
     hrtc->unix_approx = RTC_ToUnix(&hrtc->now);
@@ -80,22 +105,20 @@ HAL_StatusTypeDef RTC_Read(RTC_Handle_t *hrtc)
 HAL_StatusTypeDef RTC_Write(RTC_Handle_t *hrtc, const RTC_DateTime_t *dt)
 {
     uint8_t raw[7];
-    raw[0] = DEC2BCD(dt->seconds);
+    raw[0] = DEC2BCD(dt->seconds);   /* VL=0 -> mark clock integrity OK */
     raw[1] = DEC2BCD(dt->minutes);
     raw[2] = DEC2BCD(dt->hours);
-    raw[3] = DEC2BCD(dt->day);
-    raw[4] = DEC2BCD(dt->date);
-    raw[5] = DEC2BCD(dt->month);
+    raw[3] = DEC2BCD(dt->date);      /* days       */
+    raw[4] = DEC2BCD(dt->day);       /* weekday    */
+    raw[5] = DEC2BCD(dt->month);     /* months (century bit left 0) */
     raw[6] = DEC2BCD(dt->year);
-    return DS3231_WriteRegs(hrtc->hi2c, DS3231_REG_SECONDS, raw, 7);
+    return PCF_WriteRegs(hrtc->hi2c, PCF_REG_VL_SEC, raw, 7);
 }
 
-/* Convert unix timestamp to RTC_DateTime_t and write to DS3231.
- * No atoi / string parsing — receives uint32_t directly from BLE packet.
- */
+/* Convert unix timestamp to RTC_DateTime_t and write to the PCF8563.
+ * No atoi / string parsing — receives uint32_t directly from BLE packet. */
 HAL_StatusTypeDef RTC_SetFromUnix(RTC_Handle_t *hrtc, uint32_t unix_time)
 {
-
     uint32_t remaining = unix_time;
     uint32_t total_days = remaining / 86400UL;
     remaining -= total_days * 86400UL;
@@ -106,6 +129,9 @@ HAL_StatusTypeDef RTC_SetFromUnix(RTC_Handle_t *hrtc, uint32_t unix_time)
     dt.minutes = (uint8_t)(remaining / 60U);
     dt.seconds = (uint8_t)(remaining % 60U);
 
+    /* day-of-week: 1970-01-01 was a Thursday (=4). PCF8563 weekday 0..6. */
+    dt.day = (uint8_t)((total_days + 4UL) % 7UL);
+
     /* Walk years from 1970 */
     uint32_t year = 1970;
     while (1) {
@@ -114,7 +140,7 @@ HAL_StatusTypeDef RTC_SetFromUnix(RTC_Handle_t *hrtc, uint32_t unix_time)
         total_days -= days_this_year;
         year++;
     }
-    dt.year = (uint8_t)(year - 2000);  /* DS3231 stores 0-99 */
+    dt.year = (uint8_t)(year - 2000);  /* store 0-99 */
 
     /* Walk months */
     uint8_t leap = ((year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)) ? 1U : 0U;
@@ -128,14 +154,22 @@ HAL_StatusTypeDef RTC_SetFromUnix(RTC_Handle_t *hrtc, uint32_t unix_time)
     }
     dt.month = month;
     dt.date  = (uint8_t)(total_days + 1U);
-    dt.day   = 1;  /* day-of-week: not critical for function */
 
-    return RTC_Write(hrtc, &dt);
+    HAL_StatusTypeDef s = RTC_Write(hrtc, &dt);
+    /* Keep the cached unix/struct in sync immediately so callers that read
+     * unix_approx right after a TIMESTAMP command get the new value without
+     * waiting for the next RTC_Read. */
+    hrtc->now         = dt;
+    hrtc->unix_approx = unix_time;
+    return s;
 }
 
 void RTC_TickISR(RTC_Handle_t *hrtc)
 {
     hrtc->tick_flag = 1;
+    /* Advance the cached unix clock locally so timestamps stay correct
+     * between (relatively infrequent) full RTC_Read refreshes. */
+    hrtc->unix_approx++;
 }
 
 uint8_t RTC_PopTick(RTC_Handle_t *hrtc)
@@ -145,6 +179,14 @@ uint8_t RTC_PopTick(RTC_Handle_t *hrtc)
         return 1U;
     }
     return 0U;
+}
+
+/* Clear the PCF8563 timer flag so INT# de-asserts and can fire again.
+ * Called from the app once per tick (I2C must not be touched in the ISR). */
+HAL_StatusTypeDef RTC_ClearTimerFlag(RTC_Handle_t *hrtc)
+{
+    uint8_t ctrl2 = PCF_CTRL2_TIE;   /* TIE set, TF cleared (write 0 to TF) */
+    return PCF_WriteRegs(hrtc->hi2c, PCF_REG_CTRL2, &ctrl2, 1);
 }
 
 /* Simplified unix epoch (approximation; adequate for hydration log timestamps) */

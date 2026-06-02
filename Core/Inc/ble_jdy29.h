@@ -45,6 +45,7 @@ typedef struct {
     char     line_buf[BLE_STR_LINE_MAX]; /* assembled ASCII command line          */
     uint8_t  line_len;                   /* chars accumulated                     */
     uint8_t  line_ready;                 /* 1 = complete line waiting to be read  */
+    volatile uint32_t rx_last_ms;        /* tick of most recent received byte     */
 
     BLE_ConnState_t conn_state;
 } BLE_Handle_t;
@@ -68,6 +69,11 @@ HAL_StatusTypeDef BLE_SendPacket(BLE_Handle_t *hble,
  *              (caller buffer >= BLE_STR_LINE_MAX). Returns 0 if none ready.
  * BLE_SendStr: transmit a NUL-terminated string (blocking). */
 uint8_t           BLE_GetLine(BLE_Handle_t *hble, char *out);
+
+/* BLE_IdleFlush: if ASCII chars have been buffered but no terminator (CR/LF)
+ * has arrived for `idle_ms`, finalize the line so terminal-less clients work.
+ * Call once per main loop. */
+void              BLE_IdleFlush(BLE_Handle_t *hble, uint32_t idle_ms);
 HAL_StatusTypeDef BLE_SendStr(BLE_Handle_t *hble, const char *s);
 
 /* Raw byte send (still available if needed) */

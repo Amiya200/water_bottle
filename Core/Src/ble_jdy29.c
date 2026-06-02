@@ -40,6 +40,7 @@ void BLE_StartReceive(BLE_Handle_t *hble)
 void BLE_RxISR(BLE_Handle_t *hble)
 {
     uint8_t byte = hble->rx_byte;
+    hble->rx_last_ms = HAL_GetTick();   /* for idle-line detection */
 
     /* Restart single-byte receive immediately */
     HAL_UART_Receive_IT(hble->huart, &hble->rx_byte, 1);
@@ -125,11 +126,40 @@ uint8_t BLE_GetPacket(BLE_Handle_t *hble, BLE_Packet_t *out)
     return ok;
 }
 
+/* ─── Low-level TX ──────────────────────────────────────────────────────────
+ * IMPORTANT: RX runs in interrupt mode (HAL_UART_Receive_IT armed at all
+ * times). On STM32 HAL, calling the blocking HAL_UART_Transmit() while an RX
+ * interrupt transfer is active can return HAL_BUSY and send NOTHING, because
+ * both share the same huart lock / state. That is why the device could receive
+ * commands but never reply.
+ *
+ * To avoid the conflict we push TX bytes straight to the USART data register,
+ * polling TXE/TC. This bypasses the HAL lock entirely and is safe to interleave
+ * with the armed RX interrupt. */
+static void BLE_TxRaw(BLE_Handle_t *hble, const uint8_t *data, uint16_t len)
+{
+    USART_TypeDef *U = hble->huart->Instance;
+    for (uint16_t i = 0; i < len; i++) {
+        uint32_t guard = 0;
+        /* wait for TX data register empty (TXE) */
+        while (!(U->ISR & USART_ISR_TXE)) {
+            if (++guard > 200000U) return;   /* ~ms-scale timeout, never hang */
+        }
+        U->TDR = data[i];
+    }
+    /* wait for transmission complete (TC) so the buffer can be reused safely */
+    uint32_t guard = 0;
+    while (!(U->ISR & USART_ISR_TC)) {
+        if (++guard > 200000U) return;
+    }
+}
+
 /* Transmit a pre-built binary packet (built by BLE_Build* helpers). */
 HAL_StatusTypeDef BLE_SendPacket(BLE_Handle_t *hble,
                                   const uint8_t *buf, uint8_t len)
 {
-    return HAL_UART_Transmit(hble->huart, (uint8_t *)buf, len, 1000);
+    BLE_TxRaw(hble, buf, len);
+    return HAL_OK;
 }
 
 /* ─── ASCII string-command I/O ──────────────────────────────── */
@@ -151,17 +181,33 @@ uint8_t BLE_GetLine(BLE_Handle_t *hble, char *out)
     return 1;
 }
 
-/* Transmit a NUL-terminated string (blocking). */
+/* Finalize a buffered ASCII line that never got a CR/LF terminator, once the
+ * link has been idle for `idle_ms`. Lets terminal apps that don't append a
+ * newline still work (e.g. typing "help" and hitting send). */
+void BLE_IdleFlush(BLE_Handle_t *hble, uint32_t idle_ms)
+{
+    if (hble->line_ready) return;          /* already a line waiting          */
+    if (hble->line_len == 0U) return;      /* nothing buffered                */
+    if (hble->pkt_in_frame) return;        /* mid binary frame — leave it     */
+    if ((HAL_GetTick() - hble->rx_last_ms) < idle_ms) return;
+
+    hble->line_buf[hble->line_len] = '\0';
+    hble->line_ready = 1;
+}
+
+/* Transmit a NUL-terminated string (does not collide with RX IT). */
 HAL_StatusTypeDef BLE_SendStr(BLE_Handle_t *hble, const char *s)
 {
-    return HAL_UART_Transmit(hble->huart, (uint8_t *)s, (uint16_t)strlen(s), 1000);
+    BLE_TxRaw(hble, (const uint8_t *)s, (uint16_t)strlen(s));
+    return HAL_OK;
 }
 
 /* ─── Raw byte send ─────────────────────────────────────────── */
 HAL_StatusTypeDef BLE_SendBytes(BLE_Handle_t *hble,
                                  const uint8_t *data, uint16_t len)
 {
-    return HAL_UART_Transmit(hble->huart, (uint8_t *)data, len, 1000);
+    BLE_TxRaw(hble, data, len);
+    return HAL_OK;
 }
 
 /* ─── Connection state ───────────────────────────────────────── */
@@ -182,7 +228,7 @@ uint8_t BLE_IsConnected(BLE_Handle_t *hble)
 
 static HAL_StatusTypeDef BLE_AT(BLE_Handle_t *hble, const char *cmd)
 {
-    HAL_UART_Transmit(hble->huart, (uint8_t *)cmd, (uint16_t)strlen(cmd), 500);
+    BLE_TxRaw(hble, (const uint8_t *)cmd, (uint16_t)strlen(cmd));
     HAL_Delay(100);
     return HAL_OK;
 }

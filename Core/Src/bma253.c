@@ -73,10 +73,15 @@ HAL_StatusTypeDef BMA253_ReadAccel(BMA253_Handle_t *hbma)
     uint8_t raw[6];
     if (BMA253_ReadRegs(hbma, BMA253_REG_ACCD_X_LSB, raw, 6) != HAL_OK) return HAL_ERROR;
 
-    /* 12-bit two's complement, LSB at bits[7:4], sign-extended */
-    int16_t x = (int16_t)((raw[1] << 8) | (raw[0] & 0xF0)) >> 4;
-    int16_t y = (int16_t)((raw[3] << 8) | (raw[2] & 0xF0)) >> 4;
-    int16_t z = (int16_t)((raw[5] << 8) | (raw[4] & 0xF0)) >> 4;
+    /* 12-bit two's complement. The sensor places the 8 MSBs in raw[odd] and
+     * the 4 LSBs in bits[7:4] of raw[even]. Pack so the 12-bit value's sign
+     * bit lands in bit 15 of a signed 16-bit word, then arithmetic-shift right
+     * by 4 to sign-extend.
+     * (The previous code cast to int16_t before the shift, which broke sign
+     *  extension and produced garbage acceleration values.) */
+    int16_t x = (int16_t)(((uint16_t)raw[1] << 8) | (raw[0] & 0xF0)) >> 4;
+    int16_t y = (int16_t)(((uint16_t)raw[3] << 8) | (raw[2] & 0xF0)) >> 4;
+    int16_t z = (int16_t)(((uint16_t)raw[5] << 8) | (raw[4] & 0xF0)) >> 4;
 
     /* At ±2g range, 1 LSB = 0.98 mg ≈ 1 mg  */
     hbma->accel_x_mg = x;

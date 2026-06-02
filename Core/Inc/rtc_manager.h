@@ -4,11 +4,11 @@
 #include "stm32f0xx_hal.h"
 #include <stdint.h>
 
-/* External RTC on I2C1 — DS3231 (0x68)
- * RTC_INT → PA11 (EXTI4_15) — 1 Hz square wave output
+/* External RTC on I2C1 — PCF8563 (0x51, per schematic U10)
+ * RTC_INT → PA11 (EXTI4_15) — INT# driven by the 1 Hz countdown timer
  */
 
-#define RTC_I2C_ADDR     (0x68U << 1)
+#define RTC_I2C_ADDR     (0x51U << 1)
 #define RTC_TIMEOUT_MS   100U
 
 typedef struct {
@@ -38,6 +38,7 @@ HAL_StatusTypeDef RTC_SetFromUnix(RTC_Handle_t *hrtc, uint32_t unix_time);
 
 void     RTC_TickISR(RTC_Handle_t *hrtc);
 uint8_t  RTC_PopTick(RTC_Handle_t *hrtc);
+HAL_StatusTypeDef RTC_ClearTimerFlag(RTC_Handle_t *hrtc);
 uint32_t RTC_ToUnix(const RTC_DateTime_t *dt);
 
 /* Reminder window check — takes h/m directly, no atoi */

@@ -9,6 +9,11 @@
 static uint16_t TDS_ReadADC(TDS_Handle_t *htds)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
+    /* HAL_ADC_ConfigChannel only ORs the channel bit into CHSELR; it never
+     * clears previously-selected channels. With CH2/CH3/CH7 all enabled from
+     * MX_ADC_Init, the F030 forward scanner would convert the lowest selected
+     * channel instead of ours. Clear CHSELR so ONLY CH2 (PA2/TDS) is read. */
+    htds->hadc->Instance->CHSELR = 0U;
     sConfig.Channel      = ADC_CHANNEL_2;
     sConfig.Rank         = ADC_RANK_CHANNEL_NUMBER;
     sConfig.SamplingTime = ADC_SAMPLETIME_71CYCLES_5;

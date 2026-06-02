@@ -87,6 +87,8 @@ void Error_Handler(void);
 #define BLE_STATE_GPIO_Port GPIOA
 #define BUZZER_Pin GPIO_PIN_5
 #define BUZZER_GPIO_Port GPIOB
+#define BUTTON_Pin GPIO_PIN_3
+#define BUTTON_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

@@ -1,7 +1,0 @@
-../Core/Src/buzzer.c:69:13:Buzzer_ToneOff	2
-../Core/Src/buzzer.c:59:13:Buzzer_ToneOn.constprop	2
-../Core/Src/buzzer.c:76:6:Buzzer_Init	1
-../Core/Src/buzzer.c:85:6:Buzzer_Stop	1
-../Core/Src/buzzer.c:92:9:Buzzer_IsBusy	1
-../Core/Src/buzzer.c:94:6:Buzzer_Play	4
-../Core/Src/buzzer.c:110:6:Buzzer_Update	13

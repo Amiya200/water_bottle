@@ -5,6 +5,10 @@
 static uint16_t Battery_ReadADC(Battery_Handle_t *hbat)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
+    /* Clear CHSELR first — otherwise CH2/CH3 left selected by the TDS/NTC
+     * drivers would be converted ahead of CH7 (F030 scans lowest-first),
+     * making the battery read another sensor's pin. Select ONLY CH7 (PA7). */
+    hbat->hadc->Instance->CHSELR = 0U;
     sConfig.Channel      = ADC_CHANNEL_7;
     sConfig.Rank         = ADC_RANK_CHANNEL_NUMBER;
     sConfig.SamplingTime = ADC_SAMPLETIME_71CYCLES_5;

@@ -21,11 +21,18 @@
 #define APP_BATTERY_POLL_MS    10000U
 #define APP_BLE_STATE_POLL_MS   1000U
 #define APP_REMINDER_CHECK_MS  60000U
+#define APP_BUTTON_POLL_MS        50U   /* debounce / hold tracking          */
+
+/* ─── Physical button (PRD §8.3) ────────────────────────────── */
+#define BTN_LONG_PRESS_MS       3000U   /* >=3 s  → (reserved) power toggle  */
+#define BTN_VLONG_PRESS_MS     10000U   /* >=10 s → factory reset            */
+#define BTN_RESET_CONFIRM_MS    5000U   /* warning window before wipe        */
 
 /* ─── Drink detection ──────────────────────────────────────── */
 #define DRINK_MIN_VOLUME_ML     10U    /* ignore <10 ml changes   */
 #define DRINK_SETTLE_MS         3000U
 #define DRINK_WEIGHT_STABLE_MS   500U
+#define DRINK_STABLE_BAND_G        3U   /* ± grams considered "same" level */
 
 /* ─── Hydration score thresholds ────────────────────────────── */
 #define HYDRATION_SCORE_HIGH    80
@@ -62,8 +69,21 @@ typedef struct {
     uint32_t last_battery_ms;
     uint32_t last_ble_poll_ms;
     uint32_t last_reminder_ms;
+    uint32_t last_button_ms;
+
+    /* Physical button hold tracking */
+    uint8_t  btn_was_down;
+    uint32_t btn_down_ms;
+    uint8_t  btn_reset_armed;     /* very-long press reached → wiping pending */
 
     /* Drink event state machine */
+    /* Drink detection (weight-only; IMU disabled) */
+    uint8_t  weight_seeded;       /* baseline initialised after first reading */
+    float    drink_baseline_g;    /* stable weight to measure consumption from */
+    float    last_stable_w_g;     /* previous sample, for stability tracking   */
+    uint32_t stable_since_ms;     /* when current level started being stable   */
+
+    /* (legacy IMU fields kept so other code/structs still compile) */
     uint8_t  motion_pending;
     uint32_t motion_start_ms;
     float    weight_at_motion_g;
@@ -95,7 +115,9 @@ void App_TaskTDS(AppContext_t *app);
 void App_TaskTemp(AppContext_t *app);
 void App_TaskBattery(AppContext_t *app);
 void App_TaskBLE(AppContext_t *app);
+void App_ServiceBLE(AppContext_t *app);
 void App_TaskReminder(AppContext_t *app);
+void App_TaskButton(AppContext_t *app);
 void App_TaskDailyRollup(AppContext_t *app);
 
 /* Drink detection */

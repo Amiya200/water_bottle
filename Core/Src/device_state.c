@@ -53,17 +53,31 @@ void Device_Init(DeviceContext_t *ctx)
     memset(ctx, 0, sizeof(DeviceContext_t));
     ctx->state         = DEV_STATE_BOOT;
     ctx->pending_event = EVT_NONE;
+    ctx->evt_head      = 0;
+    ctx->evt_tail      = 0;
 }
 
 void Device_PostEvent(DeviceContext_t *ctx, DeviceEvent_t evt)
 {
-    ctx->pending_event = evt;
+    if (evt == EVT_NONE) return;
+    uint8_t next = (uint8_t)((ctx->evt_head + 1U) % DEV_EVENT_QUEUE_LEN);
+    if (next == ctx->evt_tail) return;        /* queue full — drop oldest-safe */
+    ctx->evt_queue[ctx->evt_head] = evt;
+    ctx->evt_head = next;
 }
 
-void Device_Run(DeviceContext_t *ctx)
+/* Pop one queued event, or EVT_NONE if empty. */
+static DeviceEvent_t Device_PopEvent(DeviceContext_t *ctx)
 {
-    DeviceEvent_t evt = ctx->pending_event;
-    ctx->pending_event = EVT_NONE;
+    if (ctx->evt_tail == ctx->evt_head) return EVT_NONE;
+    DeviceEvent_t e = ctx->evt_queue[ctx->evt_tail];
+    ctx->evt_tail = (uint8_t)((ctx->evt_tail + 1U) % DEV_EVENT_QUEUE_LEN);
+    return e;
+}
+
+/* Apply a single event to the current state. */
+static void Device_Apply(DeviceContext_t *ctx, DeviceEvent_t evt)
+{
     if (evt == EVT_NONE) return;
 
     DeviceState_t cur = ctx->state;
@@ -123,6 +137,18 @@ void Device_Run(DeviceContext_t *ctx)
 
     default:
         break;
+    }
+}
+
+void Device_Run(DeviceContext_t *ctx)
+{
+    /* Drain ALL queued events this loop so back-to-back transitions
+     * (e.g. CMD_CALIBRATION immediately followed by CALIBRATION_DONE during
+     *  the registration flow) are never lost. Bounded by queue length. */
+    DeviceEvent_t evt;
+    uint8_t guard = DEV_EVENT_QUEUE_LEN + 1U;
+    while (guard-- && (evt = Device_PopEvent(ctx)) != EVT_NONE) {
+        Device_Apply(ctx, evt);
     }
 }
 

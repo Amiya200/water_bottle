@@ -1,4 +1,0 @@
-../Core/Src/ntc_temp.c:118:6:NTC_Init	0	static
-../Core/Src/ntc_temp.c:130:9:NTC_ReadTemp_x10	48	static
-../Core/Src/ntc_temp.c:209:7:NTC_GetTempCelsius	8	static
-../Core/Src/ntc_temp.c:218:9:NTC_IsAboveThreshold	8	static

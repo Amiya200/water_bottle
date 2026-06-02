@@ -1,6 +1,0 @@
-../Core/Src/battery.c:27:6:Battery_Init	0	static
-../Core/Src/battery.c:36:6:Battery_Update	48	static
-../Core/Src/battery.c:72:9:Battery_GetPercent	8	static
-../Core/Src/battery.c:78:9:Battery_IsCharging	0	static
-../Core/Src/battery.c:79:9:Battery_IsFull	0	static
-../Core/Src/battery.c:80:9:Battery_IsLow	0	static

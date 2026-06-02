@@ -45,9 +45,14 @@ typedef enum {
 } DeviceEvent_t;
 
 /* ─── Context ───────────────────────────────────────────────── */
+#define DEV_EVENT_QUEUE_LEN  8U
+
 typedef struct {
     DeviceState_t state;
-    DeviceEvent_t pending_event;
+    DeviceEvent_t pending_event;          /* kept for source compatibility   */
+    DeviceEvent_t evt_queue[DEV_EVENT_QUEUE_LEN];
+    uint8_t       evt_head;
+    uint8_t       evt_tail;
     uint32_t      state_entry_tick;
     uint32_t      last_low_bat_ms;
     uint8_t       lamp_mode_active;

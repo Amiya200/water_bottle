@@ -1,3 +1,0 @@
-../Core/Src/tds_sensor.c:24:6:TDS_Init	8	static
-../Core/Src/tds_sensor.c:32:10:TDS_ReadPPM	48	static
-../Core/Src/tds_sensor.c:83:9:TDS_IsAboveThreshold	8	static
