@@ -30,9 +30,7 @@ Core/Src/bringup_test.o: ../Core/Src/bringup_test.c \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_tim.h \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_tim_ex.h \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart.h \
- ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart_ex.h \
- ../Core/Inc/ws2812b.h ../Core/Inc/ntc_temp.h ../Core/Inc/tds_sensor.h \
- ../Core/Inc/hx711.h
+ ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart_ex.h
 ../Core/Inc/bringup_test.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal.h:
 ../Core/Inc/stm32f0xx_hal_conf.h:
@@ -65,7 +63,3 @@ Core/Src/bringup_test.o: ../Core/Src/bringup_test.c \
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_tim_ex.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart_ex.h:
-../Core/Inc/ws2812b.h:
-../Core/Inc/ntc_temp.h:
-../Core/Inc/tds_sensor.h:
-../Core/Inc/hx711.h:

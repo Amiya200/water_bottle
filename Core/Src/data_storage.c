@@ -73,8 +73,8 @@ void Storage_LoadSettings(DeviceSettings_t *out)
     if (out->magic != SETTINGS_MAGIC) {
         memset(out, 0, sizeof(DeviceSettings_t));
         Storage_DefaultPrefs(&out->prefs);
-        out->hx711_scale   = 440.0f;
-        out->tare_offset   = 0.0f;
+        out->hx711_scale_x100 = 44000L;
+        out->tare_offset       = 0L;
         out->is_registered = 0;
         out->is_calibrated = 0;
     }

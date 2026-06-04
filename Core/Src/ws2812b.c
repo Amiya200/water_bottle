@@ -31,8 +31,10 @@ static uint16_t ws2812b_dma_buf[WS2812B_DMA_BUF_SIZE];
 static RGB_t     s_leds[WS2812B_NUM_LEDS];
 static TIM_HandleTypeDef *s_htim = NULL;
 
-volatile uint8_t  ws2812b_busy        = 0;
-volatile uint32_t ws2812b_send_count = 0;   /* always allocated — bringup_test.c refs it */
+volatile uint8_t  ws2812b_busy = 0;
+#if defined(WS2812B_DEBUG_COUNTERS) || defined(BRINGUP_TEST_MODE)
+volatile uint32_t ws2812b_send_count = 0;
+#endif
 
 /* ─── Pattern state ──────────────────────────────────────────────────────── */
 static uint8_t       s_pattern       = LED_PATTERN_NONE;
@@ -101,7 +103,9 @@ void WS2812B_Send(void)
     WS2812B_Pack();
     s_dirty = 0;
     ws2812b_busy = 1;
+#if defined(WS2812B_DEBUG_COUNTERS) || defined(BRINGUP_TEST_MODE)
     ws2812b_send_count++;
+#endif
     HAL_TIM_PWM_Start_DMA(s_htim, TIM_CHANNEL_1,
                           (uint32_t *)ws2812b_dma_buf, WS2812B_DMA_BUF_SIZE);
 }
@@ -330,7 +334,8 @@ void WS2812B_Update(void)
     SendIfDirty();
 }
 
-/* ─── WS2812B_SelfTest — always compiled (bringup_test.c calls it) ─────── */
+/* ─── WS2812B_SelfTest — compiled only for bring-up/self-test builds ─────── */
+#if defined(WS2812B_SELFTEST) || defined(BRINGUP_TEST_MODE)
 void WS2812B_SelfTest(void)
 {
 #define ST_SOLID(r,g,b,ms) \
@@ -373,3 +378,4 @@ void WS2812B_SelfTest(void)
     s_dirty        = 1;
 #undef ST_SOLID
 }
+#endif /* WS2812B_SELFTEST || BRINGUP_TEST_MODE */

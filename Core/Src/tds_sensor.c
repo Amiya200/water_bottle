@@ -64,23 +64,25 @@ uint16_t TDS_ReadPPM(TDS_Handle_t *htds, int16_t temp_x10)
     /* Compensated voltage in mV × 1000 / coeff → keep in mV */
     uint32_t comp_mv = (voltage_mv * 1000U) / (uint32_t)coeff_x1000;
 
-    /* DFRobot empirical formula (voltage in V):
+    /* DFRobot empirical formula, fixed-point only:
      * ppm = (133.42*V^3 - 255.86*V^2 + 857.39*V) * 0.5
-     * We work in mV to avoid float division. V = comp_mv/1000.
-     * Scale everything ×1000 to keep integer, then divide at end.
+     * V = comp_mv / 1000.
      *
-     * Use float soft-fp here — this does NOT pull in printf/scanf/sscanf,
-     * only the soft-float multiply/add runtime (~300 B, already present).
+     * ppm_x1000 = 66710*mV^3/1e9 - 127930*mV^2/1e6 + 428695*mV/1000
+     * Using int64 avoids Cortex-M0 soft-float helpers and keeps accuracy.
      */
-    float v   = (float)comp_mv / 1000.0f;
-    float ppm = (133.42f * v * v * v
-               - 255.86f * v * v
-               + 857.39f * v) * 0.5f;
+    int64_t m  = (int64_t)comp_mv;
+    int64_t m2 = m * m;
+    int64_t m3 = m2 * m;
 
-    if (ppm < 0.0f) ppm = 0.0f;
-    if (ppm > 65535.0f) ppm = 65535.0f;
+    int64_t ppm_x1000 = ((66710LL  * m3) / 1000000000LL)
+                      - ((127930LL * m2) / 1000000LL)
+                      + ((428695LL * m)  / 1000LL);
 
-    htds->last_ppm = (uint16_t)ppm;
+    if (ppm_x1000 < 0) ppm_x1000 = 0;
+    if (ppm_x1000 > 65535000LL) ppm_x1000 = 65535000LL;
+
+    htds->last_ppm = (uint16_t)((ppm_x1000 + 500LL) / 1000LL);
     htds->valid    = 1;
     return htds->last_ppm;
 }

@@ -81,7 +81,9 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc);
  * @note   Uses float division; avoid in tight ISR / low-power loops.
  *         Equivalent to (float)NTC_ReadTemp_x10(hntc) / 10.0f
  */
+#ifdef NTC_ENABLE_FLOAT_CELSIUS
 float   NTC_GetTempCelsius(NTC_Handle_t *hntc);
+#endif
 
 /**
  * @brief  Threshold comparator.

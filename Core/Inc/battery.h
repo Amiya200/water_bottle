@@ -29,7 +29,7 @@ typedef struct {
     ADC_HandleTypeDef *hadc;
     uint8_t  percent;
     uint16_t voltage_mv;
-    Battery_Status_t status;
+    uint8_t  status;        /* Battery_Status_t stored as byte */
     uint8_t  valid;
 } Battery_Handle_t;
 

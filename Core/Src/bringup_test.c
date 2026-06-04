@@ -1,4 +1,6 @@
+#include "bringup_test.h"
 
+#ifdef BRINGUP_TEST_MODE
 #include "bringup_test.h"
 #include "ws2812b.h"
 #include "ntc_temp.h"
@@ -40,7 +42,7 @@ static void BringUp_ReadHX711(void)
     if (g_test.hx_ready) {
         int32_t raw = HX711_ReadRaw(&s_hx);
         g_test.hx_raw   = raw;
-        g_test.hx_grams = (float)(raw - s_hx.tare_offset) / HX711_DEFAULT_SCALE;
+        g_test.hx_grams = HX711_ReadGrams(&s_hx);
         g_test.hx_status = TEST_PASS;
     } else {
         g_test.hx_status = TEST_FAIL;
@@ -137,3 +139,4 @@ void BringUp_RunLoop(void)
     /* Drive the RGB animation */
     WS2812B_Update();
 }
+#endif /* BRINGUP_TEST_MODE */

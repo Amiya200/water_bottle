@@ -31,7 +31,7 @@ static const BuzzerStep_t PATTERN_CALIB_DONE[]   = {{100,80,1},{200,0,1},{0,0,0}
 static const BuzzerStep_t PATTERN_ERROR[]        = {{500,200,3},{0,0,0}};
 static const BuzzerStep_t PATTERN_REG_OK[]       = {{100,60,2},{250,0,1},{0,0,0}};
 
-static const BuzzerStep_t *s_patterns[] = {
+static const BuzzerStep_t * const s_patterns[] = {
     NULL,                   /* BUZZER_NONE            */
     PATTERN_STARTUP,        /* BUZZER_STARTUP         */
     PATTERN_DOUBLE_BEEP,    /* BUZZER_DOUBLE_BEEP     */

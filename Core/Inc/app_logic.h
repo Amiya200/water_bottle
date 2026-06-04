@@ -2,16 +2,7 @@
 #define APP_LOGIC_H
 
 #include "stm32f0xx_hal.h"
-#include "hx711.h"
-#include "tds_sensor.h"
-#include "ntc_temp.h"
-#include "battery.h"
-#include "bma253.h"
-#include "ble_jdy29.h"
 #include "ble_protocol.h"
-#include "data_storage.h"
-#include "rtc_manager.h"
-#include "device_state.h"
 #include <stdint.h>
 
 /* ─── Sensor poll intervals ─────────────────────────────────── */
@@ -21,137 +12,79 @@
 #define APP_BATTERY_POLL_MS    10000U
 #define APP_BLE_STATE_POLL_MS   1000U
 #define APP_REMINDER_CHECK_MS  60000U
-#define APP_BUTTON_POLL_MS        50U   /* debounce / hold tracking          */
+#define APP_BUTTON_POLL_MS        50U
 
-/* ─── Physical button (PRD §8.3) ────────────────────────────── */
-#define BTN_LONG_PRESS_MS       3000U   /* >=3 s  → (reserved) power toggle  */
-#define BTN_VLONG_PRESS_MS     10000U   /* >=10 s → factory reset            */
-#define BTN_RESET_CONFIRM_MS    5000U   /* warning window before wipe        */
+/* ─── Physical button ───────────────────────────────────────── */
+#define BTN_LONG_PRESS_MS       3000U
+#define BTN_VLONG_PRESS_MS     10000U
+#define BTN_RESET_CONFIRM_MS    5000U
 
-/* ─── Drink detection ──────────────────────────────────────── */
-#define DRINK_MIN_VOLUME_ML     10U    /* ignore <10 ml changes   */
+/* ─── Drink detection ───────────────────────────────────────── */
+#define DRINK_MIN_VOLUME_ML     10U
 #define DRINK_SETTLE_MS         3000U
 #define DRINK_WEIGHT_STABLE_MS   500U
-#define DRINK_STABLE_BAND_G        3U   /* ± grams considered "same" level */
+#define DRINK_STABLE_BAND_G        3U
 
 /* ─── Hydration score thresholds ────────────────────────────── */
 #define HYDRATION_SCORE_HIGH    80
 #define HYDRATION_SCORE_MID     50
 
-/* ─── App context ────────────────────────────────────────────── */
-typedef struct {
-    /* Handles */
-    HX711_Handle_t    hx711;
-    TDS_Handle_t      tds;
-    NTC_Handle_t      ntc;
-    Battery_Handle_t  bat;
-    BMA253_Handle_t   bma;
-    BLE_Handle_t      ble;
-    RTC_Handle_t      rtc;
-    DeviceContext_t   dev;
-
-    /* Storage */
-    DeviceSettings_t  settings;
-    DrinkLog_t        drink_log;
-    DailySummaryLog_t daily_log;
-
-    /* Sensor readings — integer types, no float in context */
-    float    current_weight_g;   /* HX711 still uses float internally */
-    float    prev_weight_g;
-    uint16_t current_tds_ppm;    /* was float — uint16 saves 2 bytes */
-    int16_t  current_temp_x10;   /* °C × 10 — was float, saves 2 bytes */
-    uint8_t  current_bat_pct;
-
-    /* Timers */
-    uint32_t last_weight_ms;
-    uint32_t last_tds_ms;
-    uint32_t last_temp_ms;
-    uint32_t last_battery_ms;
-    uint32_t last_ble_poll_ms;
-    uint32_t last_reminder_ms;
-    uint32_t last_button_ms;
-
-    /* Physical button hold tracking */
-    uint8_t  btn_was_down;
-    uint32_t btn_down_ms;
-    uint8_t  btn_reset_armed;     /* very-long press reached → wiping pending */
-
-    /* Drink event state machine */
-    /* Drink detection (weight-only; IMU disabled) */
-    uint8_t  weight_seeded;       /* baseline initialised after first reading */
-    float    drink_baseline_g;    /* stable weight to measure consumption from */
-    float    last_stable_w_g;     /* previous sample, for stability tracking   */
-    uint32_t stable_since_ms;     /* when current level started being stable   */
-
-    /* (legacy IMU fields kept so other code/structs still compile) */
-    uint8_t  motion_pending;
-    uint32_t motion_start_ms;
-    float    weight_at_motion_g;
-
-    /* Hydration */
-    uint16_t consumed_today_ml;
-    uint8_t  hydration_score;
-    uint32_t current_day_unix;
-
-    /* Flags */
-    uint8_t  purity_alert_active;
-    uint8_t  temp_alert_active;
-    uint8_t  lamp_color_set;
-} AppContext_t;
-
-/* ─── API ───────────────────────────────────────────────────── */
-void App_Init(AppContext_t *app,
-              ADC_HandleTypeDef  *hadc,
+/*
+ * RAM-optimised app API
+ * ---------------------
+ * The old public app-context workflow was removed.  app_logic.c now
+ * owns only the state it actually uses as file-scope static variables.  main.c
+ * calls App_Init() once and App_Run() forever; interrupts are forwarded through
+ * the small App_*ISR wrappers below.
+ */
+void App_Init(ADC_HandleTypeDef  *hadc,
               I2C_HandleTypeDef  *hi2c,
               UART_HandleTypeDef *huart,
               TIM_HandleTypeDef  *htim_ws,
               TIM_HandleTypeDef  *htim_buz);
 
-void App_Run(AppContext_t *app);
+void App_Run(void);
 
-/* Sensor tasks */
-void App_TaskWeight(AppContext_t *app);
-void App_TaskTDS(AppContext_t *app);
-void App_TaskTemp(AppContext_t *app);
-void App_TaskBattery(AppContext_t *app);
-void App_TaskBLE(AppContext_t *app);
-void App_ServiceBLE(AppContext_t *app);
-void App_TaskReminder(AppContext_t *app);
-void App_TaskButton(AppContext_t *app);
-void App_TaskDailyRollup(AppContext_t *app);
+/* Interrupt forwarders used by main.c callbacks. */
+void App_BMA_MotionISR(void);
+void App_RTC_TickISR(void);
+void App_BLE_RxISR(void);
 
-/* Drink detection */
-void App_CheckDrinkEvent(AppContext_t *app);
-void App_RecordDrinkEvent(AppContext_t *app, float volume_ml);
+/* Sensor/task entry points kept public for test builds. */
+void App_TaskWeight(void);
+void App_TaskTDS(void);
+void App_TaskTemp(void);
+void App_TaskBattery(void);
+void App_TaskBLE(void);
+void App_ServiceBLE(void);
+void App_TaskReminder(void);
+void App_TaskButton(void);
+void App_TaskDailyRollup(void);
 
-/* Hydration */
-uint8_t App_CalcHydrationScore(AppContext_t *app);
-void    App_ResetDailyConsumed(AppContext_t *app);
+void    App_CheckDrinkEvent(void);
+void    App_RecordDrinkEvent(uint16_t volume_ml);
+uint8_t App_CalcHydrationScore(void);
+void    App_ResetDailyConsumed(void);
 
-/* BLE command dispatch — takes binary packet */
-void App_HandleBLECommand(AppContext_t *app, const BLE_Packet_t *pkt);
+void App_HandleBLECommand(const BLE_Packet_t *pkt);
+void App_HandleStringCommand(char *line);
 
-/* ASCII string-command dispatch (parallel to binary). `line` is mutable. */
-void App_HandleStringCommand(AppContext_t *app, char *line);
+void App_Cmd_Timestamp(const BLE_Packet_t *pkt);
+void App_Cmd_InputData(const BLE_Packet_t *pkt);
+void App_Cmd_Calibration(const BLE_Packet_t *pkt);
+void App_Cmd_LampMode(const BLE_Packet_t *pkt);
+void App_Cmd_SoftReset(void);
+void App_Cmd_FactoryReset(void);
+void App_Cmd_HistoricalAggregates(void);
+void App_Cmd_RegisterDevice(const BLE_Packet_t *pkt);
+void App_Cmd_UnpairDevice(void);
+void App_Cmd_SensorLogs(void);
+void App_Cmd_SyncAck(const BLE_Packet_t *pkt);
+void App_Cmd_DeviceStatus(void);
+void App_Cmd_GetConfig(void);
+void App_Cmd_GetErrors(void);
+void App_Cmd_Ping(void);
 
-/* Individual command handlers */
-void App_Cmd_Timestamp(AppContext_t *app, const BLE_Packet_t *pkt);
-void App_Cmd_InputData(AppContext_t *app, const BLE_Packet_t *pkt);
-void App_Cmd_Calibration(AppContext_t *app, const BLE_Packet_t *pkt);
-void App_Cmd_LampMode(AppContext_t *app, const BLE_Packet_t *pkt);
-void App_Cmd_SoftReset(AppContext_t *app);
-void App_Cmd_FactoryReset(AppContext_t *app);
-void App_Cmd_HistoricalAggregates(AppContext_t *app);
-void App_Cmd_RegisterDevice(AppContext_t *app, const BLE_Packet_t *pkt);
-void App_Cmd_UnpairDevice(AppContext_t *app);
-void App_Cmd_SensorLogs(AppContext_t *app);
-void App_Cmd_SyncAck(AppContext_t *app, const BLE_Packet_t *pkt);
-void App_Cmd_DeviceStatus(AppContext_t *app);
-void App_Cmd_GetConfig(AppContext_t *app);
-void App_Cmd_GetErrors(AppContext_t *app);
-void App_Cmd_Ping(AppContext_t *app);
-
-/* Utility */
-void App_SendACK(AppContext_t *app, uint8_t cmd_id, uint8_t success, uint8_t err_code);
+void App_SendACK(uint8_t cmd_id, uint8_t success, uint8_t err_code);
 
 #endif /* APP_LOGIC_H */

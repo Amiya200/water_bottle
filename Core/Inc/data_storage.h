@@ -27,10 +27,10 @@
 #define STORAGE_DAILY_ADDR      0x08007C00UL   /* page 31 */
 
 /* ─── Magic number & array sizes ────────────────────────────────────────── */
-#define SETTINGS_MAGIC              0xA55A1234UL
+#define SETTINGS_MAGIC              0xA55A1235UL   /* v2: fixed-point HX711 scale */
 
-#define STORAGE_MAX_DRINK_EVENTS    20U   /* was 50 — saves 360 bytes RAM */
-#define STORAGE_MAX_DAILY_DAYS      14U   /* was 30 — saves 192 bytes RAM */
+#define STORAGE_MAX_DRINK_EVENTS    12U   /* more optimised: 12 × 12 = 144 B */
+#define STORAGE_MAX_DAILY_DAYS       7U   /* more optimised: 7 × 12 = 84 B */
 
 /* ─── BLE preferences payload ───────────────────────────────────────────── */
 typedef struct {
@@ -62,9 +62,9 @@ typedef struct {
     uint8_t            device_nickname[16];
     uint8_t            is_registered;
     uint8_t            is_calibrated;
-    uint8_t            _pad[2];          /* align floats to 4-byte boundary   */
-    float              tare_offset;
-    float              hx711_scale;
+    uint8_t            _pad[2];          /* align 32-bit calibration fields    */
+    int32_t            tare_offset;       /* HX711 empty raw baseline          */
+    int32_t            hx711_scale_x100;  /* counts-per-gram × 100             */
     uint32_t           crc;              /* CRC32 of all fields above         */
 } DeviceSettings_t;
 
@@ -86,10 +86,10 @@ typedef struct {
 
 /* ─── DrinkLog_t ─────────────────────────────────────────────────────────── */
 typedef struct {
-    DrinkEvent_t events[STORAGE_MAX_DRINK_EVENTS]; /* 20 × 12 = 240 B      */
+    DrinkEvent_t events[STORAGE_MAX_DRINK_EVENTS]; /* 12 × 12 = 144 B      */
     uint8_t      count;
     uint8_t      dirty;
-} DrinkLog_t;              /* 242 bytes total (was 602)                     */
+} DrinkLog_t;              /* 146 bytes total, before alignment              */
 
 /* ─── DailySummary_t ─────────────────────────────────────────────────────── */
 typedef struct {
@@ -106,10 +106,10 @@ typedef struct {
  * Named DailySummaryLog_t (not DailyLog_t) to match data_storage.c usage.
  */
 typedef struct {
-    DailySummary_t days[STORAGE_MAX_DAILY_DAYS]; /* 14 × 12 = 168 B        */
+    DailySummary_t days[STORAGE_MAX_DAILY_DAYS]; /* 7 × 12 = 84 B          */
     uint8_t        count;
     uint8_t        dirty;
-} DailySummaryLog_t;           /* 170 bytes total (was 362)                 */
+} DailySummaryLog_t;           /* 86 bytes total, before alignment           */
 
 /* ─── CRC helper (used internally and by tests) ──────────────────────────── */
 uint32_t Storage_CRC32(const uint8_t *data, uint16_t len);

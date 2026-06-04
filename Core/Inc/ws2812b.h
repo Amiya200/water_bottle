@@ -89,7 +89,9 @@ extern volatile uint8_t  ws2812b_busy;
  * defined in any build that uses bringup_test.c.
  * Simplest: define WS2812B_DEBUG_COUNTERS in bringup_test.h (see that file).
  */
+#if defined(WS2812B_DEBUG_COUNTERS) || defined(BRINGUP_TEST_MODE)
 extern volatile uint32_t ws2812b_send_count;
+#endif
 
 /* ─── API ────────────────────────────────────────────────────────────────── */
 void    WS2812B_Init(TIM_HandleTypeDef *htim);
@@ -113,6 +115,8 @@ uint8_t WS2812B_IsBusy(void);
  * (e.g. add -DWS2812B_SELFTEST to the BRINGUP_TEST_MODE build configuration,
  * or define both in bringup_test.h).
  */
+#if defined(WS2812B_SELFTEST) || defined(BRINGUP_TEST_MODE)
 void    WS2812B_SelfTest(void);
+#endif
 
 #endif /* WS2812B_H */

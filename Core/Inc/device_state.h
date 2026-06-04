@@ -48,9 +48,9 @@ typedef enum {
 #define DEV_EVENT_QUEUE_LEN  8U
 
 typedef struct {
-    DeviceState_t state;
-    DeviceEvent_t pending_event;          /* kept for source compatibility   */
-    DeviceEvent_t evt_queue[DEV_EVENT_QUEUE_LEN];
+    uint8_t       state;                  /* DeviceState_t stored as byte    */
+    uint8_t       pending_event;          /* DeviceEvent_t stored as byte    */
+    uint8_t       evt_queue[DEV_EVENT_QUEUE_LEN];
     uint8_t       evt_head;
     uint8_t       evt_tail;
     uint32_t      state_entry_tick;

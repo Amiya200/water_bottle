@@ -40,7 +40,7 @@ DMA_HandleTypeDef hdma_tim1_ch1;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-static AppContext_t g_app;
+/* App workflow state is now compact and private inside app_logic.c. */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -94,8 +94,7 @@ int main(void)
 #else
   /* ── FULL APPLICATION ────────────────────────────────────────────────
    * Initialises every driver + state machine. */
-  App_Init(&g_app,
-           &hadc,
+  App_Init(&hadc,
            &hi2c1,
            &huart1,
            &htim1,   /* WS2812B — TIM1 CH1 DMA */
@@ -110,7 +109,7 @@ int main(void)
 #ifdef BRINGUP_TEST_MODE
     BringUp_RunLoop();
 #else
-    App_Run(&g_app);
+    App_Run();
 #endif
     /* USER CODE END 3 */
   }
@@ -439,8 +438,9 @@ static void MX_GPIO_Init(void)
 
 /* ── Application-wide HAL callbacks ───────────────────────────────────────
  * These forward hardware interrupts to the right driver. They live here (not
- * in a driver file) because they need access to the single g_app instance.
- * In BRINGUP_TEST_MODE the app context isn't initialised, so the bodies are
+ * in a driver file) so CubeMX-generated sections stay untouched.
+ * app_logic.c exposes tiny ISR forwarders instead of a public context.
+ * In BRINGUP_TEST_MODE the app state is not initialised, so the bodies are
  * compiled out — the bring-up test polls instead of using interrupts. */
 
 #ifndef BRINGUP_TEST_MODE
@@ -449,9 +449,9 @@ static void MX_GPIO_Init(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == MOTION_INT_Pin) {
-    BMA253_MotionISR(&g_app.bma);
+    App_BMA_MotionISR();
   } else if (GPIO_Pin == RTC_INT_Pin) {
-    RTC_TickISR(&g_app.rtc);
+    App_RTC_TickISR();
   }
 }
 
@@ -459,7 +459,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1) {
-    BLE_RxISR(&g_app.ble);
+    App_BLE_RxISR();
   }
 }
 

@@ -28,6 +28,7 @@
 #include "ntc_temp.h"
 
 /* ── Debug globals — watch ALL of these in Live Expressions ─────────────── */
+#ifdef NTC_DEBUG_VARS
 volatile uint16_t g_ntc_raw_adc        = 0;
 volatile uint16_t g_ntc_adc_avg        = 0;
 volatile uint8_t  g_ntc_lut_idx        = 0;
@@ -36,6 +37,12 @@ volatile int16_t  g_ntc_temp_x10       = 0;
 volatile uint8_t  g_ntc_fault          = 0;
 volatile uint32_t g_ntc_chselr_before  = 0;
 volatile uint32_t g_ntc_chselr_after   = 0;
+#define NTC_DBG_SET(name, value) do { (name) = (value); } while (0)
+#define NTC_DBG_FAULT_IF_CLEAR(value) do { if (g_ntc_fault == 0U) g_ntc_fault = (value); } while (0)
+#else
+#define NTC_DBG_SET(name, value) do { } while (0)
+#define NTC_DBG_FAULT_IF_CLEAR(value) do { } while (0)
+#endif
 
 /* ---------------------------------------------------------------------------
  * LUT: ADC vs temperature
@@ -78,7 +85,7 @@ static uint16_t NTC_ReadADC(NTC_Handle_t *hntc)
     ADC_ChannelConfTypeDef sConfig = {0};
 
     /* Snapshot CHSELR before clearing so you can see what was there */
-    g_ntc_chselr_before = hntc->hadc->Instance->CHSELR;
+    NTC_DBG_SET(g_ntc_chselr_before, hntc->hadc->Instance->CHSELR);
 
     /* ── CRITICAL FIX ────────────────────────────────────────────────────
      * HAL_ADC_ConfigChannel does CHSELR |= channel_bit, never clears.
@@ -93,21 +100,21 @@ static uint16_t NTC_ReadADC(NTC_Handle_t *hntc)
     HAL_ADC_ConfigChannel(hntc->hadc, &sConfig);
 
     /* Should be 0x00000008 (bit 3 = CH3) after this */
-    g_ntc_chselr_after = hntc->hadc->Instance->CHSELR;
+    NTC_DBG_SET(g_ntc_chselr_after, hntc->hadc->Instance->CHSELR);
 
     HAL_ADC_Start(hntc->hadc);
 
     if (HAL_ADC_PollForConversion(hntc->hadc, 10U) != HAL_OK) {
         HAL_ADC_Stop(hntc->hadc);
-        g_ntc_fault    = 5;
-        g_ntc_raw_adc  = 9999;   /* sentinel: timeout */
+        NTC_DBG_SET(g_ntc_fault, 5U);
+        NTC_DBG_SET(g_ntc_raw_adc, 9999U);   /* sentinel: timeout */
         return 2048U;
     }
 
     uint16_t val = (uint16_t)HAL_ADC_GetValue(hntc->hadc);
     HAL_ADC_Stop(hntc->hadc);
 
-    g_ntc_raw_adc = val;
+    NTC_DBG_SET(g_ntc_raw_adc, val);
     return val;
 }
 
@@ -129,7 +136,7 @@ void NTC_Init(NTC_Handle_t *hntc, ADC_HandleTypeDef *hadc)
  */
 int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
 {
-    g_ntc_fault = 0;
+    NTC_DBG_SET(g_ntc_fault, 0U);
 
     /* ── 1. Average 4 samples ────────────────────────────────────────── */
     uint32_t sum = 0U;
@@ -138,16 +145,16 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
         HAL_Delay(2);
     }
     uint16_t adc_avg = (uint16_t)(sum >> 2);
-    g_ntc_adc_avg = adc_avg;
+    NTC_DBG_SET(g_ntc_adc_avg, adc_avg);
 
     /* ── 2. Fault detection ──────────────────────────────────────────── */
     if (adc_avg < 10U) {
-        g_ntc_fault = 1;   /* open / floating */
+        NTC_DBG_SET(g_ntc_fault, 1U);   /* open / floating */
         hntc->valid = 0;
         return hntc->last_temp_x10;
     }
     if (adc_avg > (NTC_ADC_RESOLUTION - 11U)) {
-        g_ntc_fault = 2;   /* shorted to Vcc */
+        NTC_DBG_SET(g_ntc_fault, 2U);   /* shorted to Vcc */
         hntc->valid = 0;
         return hntc->last_temp_x10;
     }
@@ -162,9 +169,9 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
 
     if (idx >= (NTC_LUT_ENTRIES - 1U)) {
         idx = NTC_LUT_ENTRIES - 2U;
-        g_ntc_fault = 3;
+        NTC_DBG_SET(g_ntc_fault, 3U);
     }
-    g_ntc_lut_idx = idx;
+    NTC_DBG_SET(g_ntc_lut_idx, idx);
 
     /* ── 4. Linear interpolation ─────────────────────────────────────── */
     int32_t t_lo_x10  = ((int32_t)NTC_LUT_TEMP_MIN
@@ -179,37 +186,40 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
     if (adc_range == 0) {
         hntc->last_temp_x10 = (int16_t)t_lo_x10;
         hntc->valid         = 1;
-        g_ntc_temp_x10      = hntc->last_temp_x10;
+        NTC_DBG_SET(g_ntc_temp_x10, hntc->last_temp_x10);
         return hntc->last_temp_x10;
     }
 
     int32_t frac = ((adc_lo - (int32_t)adc_avg) * 100) / adc_range;
 
     if (frac < 0 || frac > 100) {
-        g_ntc_fault = (g_ntc_fault == 0) ? 4U : g_ntc_fault;
+        NTC_DBG_FAULT_IF_CLEAR(4U);
     }
     if (frac <   0) { frac =   0; }
     if (frac > 100) { frac = 100; }
 
-    g_ntc_frac = frac;
+    NTC_DBG_SET(g_ntc_frac, frac);
 
     int32_t temp_x10 = t_lo_x10 + ((t_hi_x10 - t_lo_x10) * frac) / 100;
 
     hntc->last_temp_x10 = (int16_t)temp_x10;
     hntc->valid         = 1;
-    g_ntc_temp_x10      = hntc->last_temp_x10;
+    NTC_DBG_SET(g_ntc_temp_x10, hntc->last_temp_x10);
 
     return hntc->last_temp_x10;
 }
 
 /* ===========================================================================
- * NTC_GetTempCelsius — returns float °C (avoid in ISRs)
+ * Optional float convenience wrapper. Keep disabled in production to avoid
+ * Cortex-M0 soft-float helpers in Flash.
  * ===========================================================================
  */
+#ifdef NTC_ENABLE_FLOAT_CELSIUS
 float NTC_GetTempCelsius(NTC_Handle_t *hntc)
 {
     return (float)NTC_ReadTemp_x10(hntc) / 10.0f;
 }
+#endif
 
 /* ===========================================================================
  * NTC_IsAboveThreshold

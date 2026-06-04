@@ -36,10 +36,7 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Core/Inc/ble_protocol.h ../Core/Inc/rtc_manager.h \
  ../Core/Inc/data_storage.h ../Core/Inc/device_state.h \
  ../Core/Inc/ws2812b.h ../Core/Inc/buzzer.h ../Core/Inc/app_logic.h \
- ../Core/Inc/hx711.h ../Core/Inc/tds_sensor.h ../Core/Inc/ntc_temp.h \
- ../Core/Inc/battery.h ../Core/Inc/bma253.h ../Core/Inc/ble_jdy29.h \
- ../Core/Inc/data_storage.h ../Core/Inc/rtc_manager.h \
- ../Core/Inc/device_state.h ../Core/Inc/bringup_test.h
+ ../Core/Inc/bringup_test.h
 ../Core/Inc/main.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal.h:
 ../Core/Inc/stm32f0xx_hal_conf.h:
@@ -88,13 +85,4 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/ws2812b.h:
 ../Core/Inc/buzzer.h:
 ../Core/Inc/app_logic.h:
-../Core/Inc/hx711.h:
-../Core/Inc/tds_sensor.h:
-../Core/Inc/ntc_temp.h:
-../Core/Inc/battery.h:
-../Core/Inc/bma253.h:
-../Core/Inc/ble_jdy29.h:
-../Core/Inc/data_storage.h:
-../Core/Inc/rtc_manager.h:
-../Core/Inc/device_state.h:
 ../Core/Inc/bringup_test.h:

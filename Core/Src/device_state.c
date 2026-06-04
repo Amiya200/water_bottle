@@ -4,7 +4,7 @@
 
 static void OnEnterState(DeviceContext_t *ctx, DeviceState_t new_state)
 {
-    ctx->state            = new_state;
+    ctx->state            = (uint8_t)new_state;
     ctx->state_entry_tick = HAL_GetTick();
 
     switch (new_state) {
@@ -52,7 +52,7 @@ void Device_Init(DeviceContext_t *ctx)
 {
     memset(ctx, 0, sizeof(DeviceContext_t));
     ctx->state         = DEV_STATE_BOOT;
-    ctx->pending_event = EVT_NONE;
+    ctx->pending_event = (uint8_t)EVT_NONE;
     ctx->evt_head      = 0;
     ctx->evt_tail      = 0;
 }
@@ -62,7 +62,7 @@ void Device_PostEvent(DeviceContext_t *ctx, DeviceEvent_t evt)
     if (evt == EVT_NONE) return;
     uint8_t next = (uint8_t)((ctx->evt_head + 1U) % DEV_EVENT_QUEUE_LEN);
     if (next == ctx->evt_tail) return;        /* queue full — drop oldest-safe */
-    ctx->evt_queue[ctx->evt_head] = evt;
+    ctx->evt_queue[ctx->evt_head] = (uint8_t)evt;
     ctx->evt_head = next;
 }
 
@@ -70,7 +70,7 @@ void Device_PostEvent(DeviceContext_t *ctx, DeviceEvent_t evt)
 static DeviceEvent_t Device_PopEvent(DeviceContext_t *ctx)
 {
     if (ctx->evt_tail == ctx->evt_head) return EVT_NONE;
-    DeviceEvent_t e = ctx->evt_queue[ctx->evt_tail];
+    DeviceEvent_t e = (DeviceEvent_t)ctx->evt_queue[ctx->evt_tail];
     ctx->evt_tail = (uint8_t)((ctx->evt_tail + 1U) % DEV_EVENT_QUEUE_LEN);
     return e;
 }
@@ -80,7 +80,7 @@ static void Device_Apply(DeviceContext_t *ctx, DeviceEvent_t evt)
 {
     if (evt == EVT_NONE) return;
 
-    DeviceState_t cur = ctx->state;
+    DeviceState_t cur = (DeviceState_t)ctx->state;
 
     switch (cur) {
     case DEV_STATE_BOOT:
@@ -154,5 +154,5 @@ void Device_Run(DeviceContext_t *ctx)
 
 DeviceState_t Device_GetState(const DeviceContext_t *ctx)
 {
-    return ctx->state;
+    return (DeviceState_t)ctx->state;
 }
