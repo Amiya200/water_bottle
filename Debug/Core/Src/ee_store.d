@@ -1,4 +1,4 @@
-Core/Src/app_logic.o: ../Core/Src/app_logic.c ../Core/Inc/app_logic.h \
+Core/Src/ee_store.o: ../Core/Src/ee_store.c ../Core/Inc/ee_store.h \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal.h \
  ../Core/Inc/stm32f0xx_hal_conf.h \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_rcc.h \
@@ -29,14 +29,8 @@ Core/Src/app_logic.o: ../Core/Src/app_logic.c ../Core/Inc/app_logic.h \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_tim.h \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_tim_ex.h \
  ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart.h \
- ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart_ex.h \
- ../Core/Inc/ble_protocol.h ../Core/Inc/main.h ../Core/Inc/ws2812b.h \
- ../Core/Inc/buzzer.h ../Core/Inc/hx711.h ../Core/Inc/tds_sensor.h \
- ../Core/Inc/ntc_temp.h ../Core/Inc/battery.h ../Core/Inc/ble_jdy29.h \
- ../Core/Inc/data_storage.h ../Core/Inc/rtc_manager.h \
- ../Core/Inc/device_state.h ../Core/Inc/ws2812b.h ../Core/Inc/buzzer.h \
- ../Core/Inc/ee_store.h
-../Core/Inc/app_logic.h:
+ ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart_ex.h
+../Core/Inc/ee_store.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal.h:
 ../Core/Inc/stm32f0xx_hal_conf.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_rcc.h:
@@ -68,18 +62,3 @@ Core/Src/app_logic.o: ../Core/Src/app_logic.c ../Core/Inc/app_logic.h \
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_tim_ex.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart.h:
 ../Drivers/STM32F0xx_HAL_Driver/Inc/stm32f0xx_hal_uart_ex.h:
-../Core/Inc/ble_protocol.h:
-../Core/Inc/main.h:
-../Core/Inc/ws2812b.h:
-../Core/Inc/buzzer.h:
-../Core/Inc/hx711.h:
-../Core/Inc/tds_sensor.h:
-../Core/Inc/ntc_temp.h:
-../Core/Inc/battery.h:
-../Core/Inc/ble_jdy29.h:
-../Core/Inc/data_storage.h:
-../Core/Inc/rtc_manager.h:
-../Core/Inc/device_state.h:
-../Core/Inc/ws2812b.h:
-../Core/Inc/buzzer.h:
-../Core/Inc/ee_store.h:

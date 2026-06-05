@@ -16,11 +16,14 @@ static uint16_t TDS_ReadADC(TDS_Handle_t *htds)
     htds->hadc->Instance->CHSELR = 0U;
     sConfig.Channel      = ADC_CHANNEL_2;
     sConfig.Rank         = ADC_RANK_CHANNEL_NUMBER;
-    sConfig.SamplingTime = ADC_SAMPLETIME_71CYCLES_5;
+    sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;  /* long settle for the resistor-divided TDS node */
     HAL_ADC_ConfigChannel(htds->hadc, &sConfig);
 
     HAL_ADC_Start(htds->hadc);
-    HAL_ADC_PollForConversion(htds->hadc, 100);
+    if (HAL_ADC_PollForConversion(htds->hadc, 100) != HAL_OK) {
+        HAL_ADC_Stop(htds->hadc);
+        return 0U;
+    }
     uint16_t val = (uint16_t)HAL_ADC_GetValue(htds->hadc);
     HAL_ADC_Stop(htds->hadc);
     return val;
@@ -48,6 +51,14 @@ uint16_t TDS_ReadPPM(TDS_Handle_t *htds, int16_t temp_x10)
     HAL_Delay(1);
     uint16_t adc_raw = TDS_ReadADC(htds);
     HAL_GPIO_WritePin(TDS_DRIVE_GPIO_Port, TDS_DRIVE_Pin, GPIO_PIN_RESET);
+
+    /* A zero conversion means either a dry probe or an ADC timeout. Treat a
+     * hard-zero as "no reading": keep the last good ppm and flag invalid so
+     * the app does not raise a false purity alert on a 0 ppm glitch. */
+    if (adc_raw == 0U) {
+        htds->valid = 0;
+        return htds->last_ppm;
+    }
 
     /* Voltage in mV */
     uint32_t voltage_mv = (uint32_t)adc_raw * TDS_ADC_VREF_MV / TDS_ADC_RESOLUTION;

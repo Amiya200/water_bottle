@@ -46,7 +46,7 @@ void App_Init(ADC_HandleTypeDef  *hadc,
 void App_Run(void);
 
 /* Interrupt forwarders used by main.c callbacks. */
-void App_BMA_MotionISR(void);
+void App_BLE_LinkISR(void);   /* PA15 BLE link-state edge (replaces IMU motion) */
 void App_RTC_TickISR(void);
 void App_BLE_RxISR(void);
 
@@ -84,6 +84,8 @@ void App_Cmd_DeviceStatus(void);
 void App_Cmd_GetConfig(void);
 void App_Cmd_GetErrors(void);
 void App_Cmd_Ping(void);
+void App_Cmd_Measure(uint8_t force);
+void App_Cmd_DumpEEPROM(void);
 
 void App_SendACK(uint8_t cmd_id, uint8_t success, uint8_t err_code);
 

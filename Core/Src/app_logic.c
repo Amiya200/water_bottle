@@ -48,6 +48,7 @@
 #include "data_storage.h"
 #include "rtc_manager.h"
 #include "device_state.h"
+#include "ee_store.h"
 #include <string.h>
 
 #ifdef NTC_DEBUG_VARS
@@ -111,6 +112,18 @@ static uint32_t                s_current_day_unix;
 static uint8_t                 s_purity_alert_active;
 static uint8_t                 s_temp_alert_active;
 
+/* BLE link-state edge handling (replaces the old IMU motion path).
+ * s_ble_link_edge is set in the PA15 EXTI ISR; s_ble_was_connected holds the
+ * last serviced level so a connect/disconnect is acted on exactly once. */
+static volatile uint8_t        s_ble_link_edge;
+static uint8_t                 s_ble_was_connected;
+
+/* Refill-workflow state: the last weight we acted on, so a MEASURE only
+ * triggers TDS/temp + an EEPROM record when the level INCREASES (water added).
+ * Seeded from the most recent EEPROM record at init so it survives a reboot. */
+static int32_t                 s_ee_prev_weight_ml;
+static uint8_t                 s_ee_prev_valid;
+
 static void App_ClearState(void)
 {
     memset(&s_hx711, 0, sizeof(s_hx711));
@@ -152,6 +165,12 @@ static void App_ClearState(void)
 
     s_purity_alert_active = 0U;
     s_temp_alert_active = 0U;
+
+    s_ble_link_edge     = 0U;
+    s_ble_was_connected = 0U;
+
+    s_ee_prev_weight_ml = 0;
+    s_ee_prev_valid     = 0U;
 }
 
 /* File-scope literals — pooled once; linker merges duplicate .rodata */
@@ -226,11 +245,13 @@ static uint8_t HX711_WaitReady(uint32_t timeout_ms)
 
 
 /* ─── Interrupt forwarders ──────────────────────────────────────────────── */
-void App_BMA_MotionISR(void)
+void App_BLE_LinkISR(void)
 {
-    /* Current production workflow is weight-only; BMA motion state was unused.
-       Keep this wrapper so main.c callback stays clean and future IMU logic can
-       be added here without reintroducing a public context. */
+    /* PA15 (JDY-23 link line) changed level. Latch an edge; the actual
+       connect/disconnect work (auto-sync, state events) is done in the main
+       loop via App_TaskBLE() so no I2C/flash happens in interrupt context.
+       This EXTI source replaces the unused BMA253 motion interrupt. */
+    s_ble_link_edge = 1U;
 }
 
 void App_RTC_TickISR(void)
@@ -265,9 +286,28 @@ void App_Init(ADC_HandleTypeDef  *hadc,
     if (RTC_Init(&s_rtc, hi2c) != HAL_OK) {
         s_rtc.unix_approx = 0;
         s_rtc.initialized = 0;
-        HAL_NVIC_DisableIRQ(EXTI4_15_IRQn);
+        /* NOTE: do NOT disable EXTI4_15 here. The BLE link-state line (PA15)
+         * shares that vector with the RTC tick (PA11); the per-pin handler
+         * in HAL_GPIO_EXTI_Callback already ignores a non-RTC source, and a
+         * dead RTC must not silence BLE connect/disconnect events. */
     }
     Storage_Init();
+
+    /* External M24512 EEPROM record log (for the MEASURE/STOREW/DUMP flow).
+     * Seed the refill comparator with the most recent stored weight so the
+     * "increase since last time" test is meaningful right after a reboot. */
+    EE_Store_Init(hi2c);
+    if (EE_Store_IsPresent()) {
+        EE_Header_t eh;
+        if (EE_Store_ReadHeader(&eh) && eh.count > 0U) {
+            uint16_t last = (uint16_t)((eh.write_idx + EE_MAX_RECORDS - 1U) % EE_MAX_RECORDS);
+            EE_Record_t er;
+            if (EE_Store_ReadRecord(last, &er)) {
+                s_ee_prev_weight_ml = er.weight_ml;
+                s_ee_prev_valid     = 1U;
+            }
+        }
+    }
 
     Storage_LoadSettings(&s_settings);
     Storage_LoadDrinkLog(&s_drink_log);
@@ -309,6 +349,11 @@ void App_Run(void)
 
     BLE_IdleFlush(&s_ble, 150U);
     App_ServiceBLE();
+
+    /* A BLE connect/disconnect edge (PA15 EXTI) is handled promptly rather
+     * than waiting for the 1 s poll, so auto-sync starts the moment the app
+     * connects. */
+    if (s_ble_link_edge) App_TaskBLE();
 
     if (now - s_last_weight_ms  >= APP_WEIGHT_POLL_MS)   App_TaskWeight();
     if (now - s_last_tds_ms     >= APP_TDS_POLL_MS)      App_TaskTDS();
@@ -471,7 +516,26 @@ void App_ServiceBLE(void)
 void App_TaskBLE(void)
 {
     s_last_ble_poll_ms = HAL_GetTick();
-    if (BLE_IsConnected(&s_ble) && s_drink_log.dirty)
+
+    uint8_t connected = BLE_IsConnected(&s_ble);
+
+    /* Act on a link-state change once, whether it arrived as a PA15 EXTI edge
+     * or was caught by this periodic poll (covers a missed edge). */
+    if (s_ble_link_edge || connected != s_ble_was_connected) {
+        s_ble_link_edge = 0U;
+        if (connected && !s_ble_was_connected) {
+            Device_PostEvent(&s_dev, EVT_BLE_CONNECTED);
+            /* App is now nearby — push anything not yet synced. */
+            if (s_drink_log.dirty) Storage_FlushDrinkLog(&s_drink_log);
+        } else if (!connected && s_ble_was_connected) {
+            Device_PostEvent(&s_dev, EVT_BLE_DISCONNECTED);
+            /* Persist queued data so nothing is lost while offline. */
+            if (s_drink_log.dirty) Storage_FlushDrinkLog(&s_drink_log);
+        }
+        s_ble_was_connected = connected;
+    }
+
+    if (connected && s_drink_log.dirty)
         Storage_FlushDrinkLog(&s_drink_log);
 }
 
@@ -568,6 +632,88 @@ uint8_t App_CalcHydrationScore(void)
     return (uint8_t)(score > 100U ? 100U : score);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EEPROM measurement workflow (command-driven, for BLE bring-up)
+ * ───────────────────────────────────────────────────────────────────────────
+ * App_DoMeasureSequence():
+ *   1. Read the load cell.
+ *   2. Compare to the previous acted-on weight.
+ *   3. If current > previous (REFILL):   read TDS + temperature, store a full
+ *      {time, weight, tds, temp} record to the external EEPROM.
+ *      If current <= previous:           do NOT power the TDS/temp sensors;
+ *      store only when 'force' is set (used by STOREW).
+ *   4. The stored record is always stamped with the current RTC time.
+ *
+ * Returns one of the MEAS_* result codes so the caller can build a reply.
+ * ═════════════════════════════════════════════════════════════════════════ */
+#define MEAS_ERR_HX711   0
+#define MEAS_REFILL      1   /* increase: TDS/temp read + stored             */
+#define MEAS_NOCHANGE    2   /* no increase, not forced: nothing read/stored */
+#define MEAS_FORCED      3   /* forced store of weight (no quality sensors)  */
+#define MEAS_ERR_EE      4   /* EEPROM write failed                          */
+
+static uint8_t App_DoMeasureSequence(uint8_t force,
+                                     int32_t *out_w,
+                                     uint16_t *out_tds,
+                                     int16_t  *out_temp,
+                                     uint32_t *out_time)
+{
+    /* ── 1. Load cell first ── */
+    if (!s_hx711.is_calibrated) return MEAS_ERR_HX711;
+    if (!HX711_WaitReady(400U))  return MEAS_ERR_HX711;
+
+    int32_t w = HX711_ReadMillilitres(&s_hx711);
+    if (!s_hx711.last_read_ok)   return MEAS_ERR_HX711;
+    s_current_weight_ml = w;
+    *out_w = w;
+
+    uint32_t now_unix = s_rtc.unix_approx;
+    *out_time = now_unix;
+
+    /* ── 2. Increase since last acted-on weight? ── */
+    uint8_t increased = (s_ee_prev_valid && w > s_ee_prev_weight_ml) ? 1U : 0U;
+    /* First-ever reading with no baseline counts as a fill so we seed a record. */
+    if (!s_ee_prev_valid) increased = 1U;
+
+    uint16_t tds  = 0U;
+    int16_t  temp = 0;
+    uint8_t  quality = 0U;
+
+    if (increased) {
+        /* ── 3a. REFILL → wake the quality sensors and read them ── */
+        temp = NTC_ReadTemp_x10(&s_ntc);          /* temp first: TDS needs it  */
+        tds  = TDS_ReadPPM(&s_tds, temp);
+        s_current_temp_x10 = temp;
+        s_current_tds_ppm  = tds;
+        quality = 1U;
+    } else if (!force) {
+        /* ── 3b. No increase and not forced → leave TDS/temp idle, no store ── */
+        *out_tds = 0U; *out_temp = 0;
+        return MEAS_NOCHANGE;
+    }
+
+    *out_tds  = tds;
+    *out_temp = temp;
+
+    /* ── 4. Build + store the timestamped record ── */
+    EE_Record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.unix_time = now_unix;       /* time the data is stored */
+    rec.weight_ml = w;
+    rec.tds_ppm   = tds;
+    rec.temp_x10  = temp;
+    rec.flags     = quality ? EE_FLAG_QUALITY : 0U;
+
+    if (!EE_Store_Append(&rec)) return MEAS_ERR_EE;
+
+    /* This weight is now the baseline for the next comparison. */
+    s_ee_prev_weight_ml = w;
+    s_ee_prev_valid     = 1U;
+
+    return increased ? MEAS_REFILL : MEAS_FORCED;
+}
+
+
 /* ─── ACK helper ────────────────────────────────────────────────────────── */
 void App_SendACK(uint8_t cmd_id, uint8_t success, uint8_t err_code)
 {
@@ -595,6 +741,9 @@ void App_HandleBLECommand(const BLE_Packet_t *pkt)
     case BLE_CMD_GET_CONFIG:   App_Cmd_GetConfig();            break;
     case BLE_CMD_GET_ERRORS:   App_Cmd_GetErrors();            break;
     case BLE_CMD_PING:         App_Cmd_Ping();                 break;
+    case BLE_CMD_MEASURE:      App_Cmd_Measure(0);             break;
+    case BLE_CMD_STORE_WEIGHT: App_Cmd_Measure(1);             break;
+    case BLE_CMD_DUMP_EEPROM:  App_Cmd_DumpEEPROM();           break;
     default:
         App_SendACK(pkt->cmd, 0, BLE_ERR_UNKNOWN_CMD);
         break;
@@ -648,9 +797,10 @@ static int s_csv(const char *s, int *out, int max)
  * ═══════════════════════════════════════════════════════════════════════════ */
 void App_HandleStringCommand(char *line)
 {
-    /* out[] reduced from 80→52: measured longest reply is 36 chars;
-     * 52 gives 16 bytes of future-growth margin. */
-    char out[52];
+    /* out[] sized for the longest reply. DUMP record lines
+     * ("R,idx,unixtime,weight,tds,temp,flags\r\n") can reach ~44 chars, so
+     * 64 bytes gives comfortable headroom. */
+    char out[64];
     char *e = out + sizeof(out);
     char *p = out;
 
@@ -674,6 +824,7 @@ void App_HandleStringCommand(char *line)
         BLE_SendStr(&s_ble, "CAL/TARE  CALWEIGHT,<grams>\r\n");
         BLE_SendStr(&s_ble, "TIME SETTIME,unix\r\n");
         BLE_SendStr(&s_ble, "REG UNPAIR SYNC RESET REBOOT SOFTRST\r\n");
+        BLE_SendStr(&s_ble, "MEASURE/M STOREW DUMP EEINFO EEFMT\r\n");
         BLE_SendStr(&s_ble, "EE RTCQ TDSQ TMPQ BATQ\r\n");
 #ifdef HYDRA_BENCH_CMDS
         BLE_SendStr(&s_ble, "PIX,i,r,g,b EER,a EEW,a,b DIAG\r\n");
@@ -1082,10 +1233,115 @@ void App_HandleStringCommand(char *line)
         return;
     }
 
+    /* ════════════════════════════════════════════════════════════════════
+     * EEPROM MEASUREMENT WORKFLOW (BLE-driven bring-up)
+     * ════════════════════════════════════════════════════════════════════ */
+
+    /* MEASURE — load cell first; only if level INCREASED do we read TDS+temp
+     * and store {time,weight,tds,temp}. No increase → sensors stay idle. */
+    if (strcmp(up, "MEASURE") == 0 || strcmp(up, "M") == 0) {
+        int32_t w; uint16_t tds; int16_t tmp; uint32_t ts;
+        uint8_t r = App_DoMeasureSequence(0U, &w, &tds, &tmp, &ts);
+        switch (r) {
+        case MEAS_REFILL:
+            p = s_app(p, e, "MEAS,REFILL,");
+            p = s_i2s(p, e, w);   *p++ = ',';
+            p = s_u2s(p, e, tds); *p++ = ',';
+            p = s_i2s(p, e, tmp); *p++ = ',';
+            p = s_u2s(p, e, ts);
+            p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+            break;
+        case MEAS_NOCHANGE:
+            p = s_app(p, e, "MEAS,NOCHG,");
+            p = s_i2s(p, e, w);
+            p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+            break;
+        case MEAS_ERR_EE:
+            BLE_SendStr(&s_ble, "MEAS,ERR,EE\r\n"); break;
+        default:
+            BLE_SendStr(&s_ble, "MEAS,ERR,HX711\r\n"); break;
+        }
+        return;
+    }
+
+    /* STOREW — read load cell now and FORCE-store a record (always). If the
+     * level also increased, TDS+temp are included; otherwise weight-only. */
+    if (strcmp(up, "STOREW") == 0) {
+        int32_t w; uint16_t tds; int16_t tmp; uint32_t ts;
+        uint8_t r = App_DoMeasureSequence(1U, &w, &tds, &tmp, &ts);
+        if (r == MEAS_REFILL || r == MEAS_FORCED) {
+            p = s_app(p, e, "STOREW,OK,");
+            p = s_i2s(p, e, w);   *p++ = ',';
+            p = s_u2s(p, e, tds); *p++ = ',';
+            p = s_i2s(p, e, tmp); *p++ = ',';
+            p = s_u2s(p, e, ts);
+            p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+        } else if (r == MEAS_ERR_EE) {
+            BLE_SendStr(&s_ble, "STOREW,ERR,EE\r\n");
+        } else {
+            BLE_SendStr(&s_ble, "STOREW,ERR,HX711\r\n");
+        }
+        return;
+    }
+
+    /* DUMP — stream every stored record from the EEPROM, oldest first. */
+    if (strcmp(up, "DUMP") == 0) {
+        if (!EE_Store_IsPresent()) { BLE_SendStr(&s_ble, "DUMP,ERR,NOEE\r\n"); return; }
+        EE_Header_t eh;
+        if (!EE_Store_ReadHeader(&eh) || eh.count == 0U) {
+            BLE_SendStr(&s_ble, "DUMP,0\r\n"); return;
+        }
+        p = s_app(p, e, "DUMP,"); p = s_u2s(p, e, eh.count);
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+
+        /* Oldest slot when the ring has wrapped is write_idx; otherwise 0. */
+        uint16_t start = (eh.count >= EE_MAX_RECORDS) ? eh.write_idx : 0U;
+        for (uint16_t k = 0U; k < eh.count; k++) {
+            uint16_t slot = (uint16_t)((start + k) % EE_MAX_RECORDS);
+            EE_Record_t er;
+            p = out;
+            if (EE_Store_ReadRecord(slot, &er)) {
+                p = s_app(p, e, "R,");
+                p = s_u2s(p, e, k);            *p++ = ',';
+                p = s_u2s(p, e, er.unix_time); *p++ = ',';
+                p = s_i2s(p, e, er.weight_ml); *p++ = ',';
+                p = s_u2s(p, e, er.tds_ppm);   *p++ = ',';
+                p = s_i2s(p, e, er.temp_x10);  *p++ = ',';
+                p = s_u2s(p, e, er.flags);
+                p = s_app(p, e, "\r\n");
+            } else {
+                p = s_app(p, e, "R,"); p = s_u2s(p, e, k);
+                p = s_app(p, e, ",BAD\r\n");
+            }
+            BLE_SendStr(&s_ble, out);
+            HAL_Delay(5);
+        }
+        BLE_SendStr(&s_ble, "DUMP,END\r\n");
+        return;
+    }
+
+    /* EEINFO — header snapshot; EEFMT — wipe the log header (records orphaned). */
+    if (strcmp(up, "EEINFO") == 0) {
+        EE_Header_t eh;
+        p = s_app(p, e, "EEI,");
+        p = s_u2s(p, e, EE_Store_IsPresent()); *p++ = ',';
+        if (EE_Store_ReadHeader(&eh)) {
+            p = s_u2s(p, e, eh.count);     *p++ = ',';
+            p = s_u2s(p, e, eh.write_idx);
+        } else { p = s_app(p, e, "0,0"); }
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+        return;
+    }
+    if (strcmp(up, "EEFMT") == 0) {
+        uint8_t ok = EE_Store_Format();
+        s_ee_prev_valid = 0U;
+        s_ee_prev_weight_ml = 0;
+        BLE_SendStr(&s_ble, ok ? S_OK : S_ERR);
+        return;
+    }
+
     BLE_SendStr(&s_ble, S_ERR);
 }
-
-/* ─── Individual command handlers ──────────────────────────────────────── */
 
 void App_Cmd_Timestamp(const BLE_Packet_t *pkt)
 {
@@ -1281,6 +1537,71 @@ void App_Cmd_Ping(void)
     uint8_t buf[BLE_PKT_MAX_LEN];
     uint8_t len = BLE_BuildPong(buf);
     BLE_SendPacket(&s_ble, buf, len);
+}
+
+/* Binary MEASURE / STORE_WEIGHT: run the same load-cell-first workflow and
+ * reply with a single result packet (weight, tds, temp, time, result code). */
+void App_Cmd_Measure(uint8_t force)
+{
+    int32_t w; uint16_t tds; int16_t tmp; uint32_t ts;
+    uint8_t r = App_DoMeasureSequence(force, &w, &tds, &tmp, &ts);
+
+    uint8_t pl[14];
+    pl[0]  = r;                               /* MEAS_* result code         */
+    pl[1]  = (uint8_t)(ts >> 24); pl[2] = (uint8_t)(ts >> 16);
+    pl[3]  = (uint8_t)(ts >>  8); pl[4] = (uint8_t)(ts);
+    pl[5]  = (uint8_t)((uint32_t)w >> 24); pl[6] = (uint8_t)((uint32_t)w >> 16);
+    pl[7]  = (uint8_t)((uint32_t)w >>  8); pl[8] = (uint8_t)((uint32_t)w);
+    pl[9]  = (uint8_t)(tds >> 8); pl[10] = (uint8_t)(tds);
+    pl[11] = (uint8_t)((uint16_t)tmp >> 8); pl[12] = (uint8_t)(tmp);
+    pl[13] = (r == MEAS_REFILL) ? EE_FLAG_QUALITY : 0U;
+
+    uint8_t buf[BLE_PKT_MAX_LEN];
+    uint8_t len = BLE_BuildPacket(buf, BLE_RSP_MEASURE, pl, sizeof(pl));
+    BLE_SendPacket(&s_ble, buf, len);
+}
+
+/* Binary DUMP: stream every stored EEPROM record as BLE_RSP_EE_RECORD frames,
+ * then a final ACK to mark the end of the stream. */
+void App_Cmd_DumpEEPROM(void)
+{
+    uint8_t buf[BLE_PKT_MAX_LEN];
+
+    if (!EE_Store_IsPresent()) {
+        App_SendACK(BLE_CMD_DUMP_EEPROM, 0, BLE_ERR_UNKNOWN_CMD);
+        return;
+    }
+
+    EE_Header_t eh;
+    if (!EE_Store_ReadHeader(&eh) || eh.count == 0U) {
+        App_SendACK(BLE_CMD_DUMP_EEPROM, 1, BLE_ERR_OK);
+        return;
+    }
+
+    uint16_t start = (eh.count >= EE_MAX_RECORDS) ? eh.write_idx : 0U;
+    for (uint16_t k = 0U; k < eh.count; k++) {
+        uint16_t slot = (uint16_t)((start + k) % EE_MAX_RECORDS);
+        EE_Record_t er;
+        if (!EE_Store_ReadRecord(slot, &er)) continue;
+
+        BLE_EERecordPayload_t pl;
+        pl.idx_hi  = (uint8_t)(k >> 8);            pl.idx_lo  = (uint8_t)k;
+        pl.unix_b3 = (uint8_t)(er.unix_time >> 24); pl.unix_b2 = (uint8_t)(er.unix_time >> 16);
+        pl.unix_b1 = (uint8_t)(er.unix_time >>  8); pl.unix_b0 = (uint8_t)(er.unix_time);
+        pl.w_b3 = (uint8_t)((uint32_t)er.weight_ml >> 24);
+        pl.w_b2 = (uint8_t)((uint32_t)er.weight_ml >> 16);
+        pl.w_b1 = (uint8_t)((uint32_t)er.weight_ml >>  8);
+        pl.w_b0 = (uint8_t)((uint32_t)er.weight_ml);
+        pl.ppm_hi  = (uint8_t)(er.tds_ppm >> 8);   pl.ppm_lo  = (uint8_t)(er.tds_ppm);
+        pl.temp_hi = (uint8_t)((uint16_t)er.temp_x10 >> 8);
+        pl.temp_lo = (uint8_t)(er.temp_x10);
+        pl.flags   = er.flags;
+
+        uint8_t len = BLE_BuildEERecord(buf, &pl);
+        BLE_SendPacket(&s_ble, buf, len);
+        HAL_Delay(15);
+    }
+    App_SendACK(BLE_CMD_DUMP_EEPROM, 1, BLE_ERR_OK);
 }
 
 void App_ResetDailyConsumed(void)

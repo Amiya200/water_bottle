@@ -64,6 +64,9 @@
 #define BLE_CMD_GET_CONFIG      0x0DU
 #define BLE_CMD_GET_ERRORS      0x0EU
 #define BLE_CMD_PING            0x0FU
+#define BLE_CMD_MEASURE         0x10U   /* load cell → conditional TDS/temp → store */
+#define BLE_CMD_STORE_WEIGHT    0x11U   /* force-store a weight record              */
+#define BLE_CMD_DUMP_EEPROM     0x12U   /* stream all EEPROM records                */
 
 /* ─── Response IDs (device → host) ──────────────────────────────────────── */
 #define BLE_RSP_ACK             0x80U
@@ -73,6 +76,8 @@
 #define BLE_RSP_CONFIG          0x84U
 #define BLE_RSP_PONG            0x85U
 #define BLE_RSP_ERR_LOG         0x86U
+#define BLE_RSP_EE_RECORD       0x87U   /* one EEPROM measurement record */
+#define BLE_RSP_MEASURE         0x88U   /* MEASURE/STORE_WEIGHT result   */
 
 /* ─── Error codes ────────────────────────────────────────────────────────── */
 #define BLE_ERR_OK              0x00U
@@ -123,6 +128,17 @@ typedef struct {
     uint8_t temp_hi, temp_lo;
 } BLE_DailyPayload_t;
 
+/* One EEPROM measurement record streamed by BLE_CMD_DUMP_EEPROM.
+ * weight is signed 32-bit (ml ≈ g); temp is signed ×10. */
+typedef struct {
+    uint8_t idx_hi,  idx_lo;
+    uint8_t unix_b3, unix_b2, unix_b1, unix_b0;
+    uint8_t w_b3,    w_b2,    w_b1,    w_b0;
+    uint8_t ppm_hi,  ppm_lo;
+    uint8_t temp_hi, temp_lo;
+    uint8_t flags;
+} BLE_EERecordPayload_t;   /* 15 bytes (fits BLE_PKT_MAX_PAYLOAD) */
+
 /* BLE_PrefsPayload_t is defined in data_storage.h to avoid circular deps */
 
 /* ─── API ────────────────────────────────────────────────────────────────── */
@@ -135,6 +151,7 @@ uint8_t BLE_BuildPong(uint8_t *buf);
 uint8_t BLE_BuildStatus(uint8_t *buf, const BLE_StatusPayload_t *s);
 uint8_t BLE_BuildLogEntry(uint8_t *buf, const BLE_LogEntryPayload_t *e);
 uint8_t BLE_BuildDaily(uint8_t *buf, const BLE_DailyPayload_t *d);
+uint8_t BLE_BuildEERecord(uint8_t *buf, const BLE_EERecordPayload_t *r);
 
 /* BLE_BuildConfig needs BLE_PrefsPayload_t — declared in data_storage.h */
 struct BLE_PrefsPayload_t;

@@ -107,3 +107,10 @@ uint8_t BLE_BuildConfig(uint8_t *buf, const void *prefs_payload)
                            (const uint8_t *)prefs_payload,
                            (uint8_t)sizeof(BLE_PrefsPayload_t));
 }
+
+uint8_t BLE_BuildEERecord(uint8_t *buf, const BLE_EERecordPayload_t *r)
+{
+    return BLE_BuildPacket(buf, BLE_RSP_EE_RECORD,
+                           (const uint8_t *)r,
+                           (uint8_t)sizeof(BLE_EERecordPayload_t));
+}

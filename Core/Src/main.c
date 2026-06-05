@@ -399,12 +399,32 @@ static void MX_GPIO_Init(void)
 
   HAL_GPIO_WritePin(GPIOA, HX711_SCK_Pin|TDS_DRIVE_Pin, GPIO_PIN_RESET);
 
-  GPIO_InitStruct.Pin = MOTION_INT_Pin|RTC_INT_Pin;
+  /* RTC 1 Hz tick (PA11) is the only rising-edge EXTI on port A now.
+   * PA0 (was BMA253 MOTION_INT) is left as a plain input: the IMU motion
+   * interrupt has been removed — drink detection is weight-based and the
+   * BLE link-state line replaces it as the only asynchronous wake source. */
+  GPIO_InitStruct.Pin = RTC_INT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = HX711_DOUT_Pin|BLE_STATE_Pin;
+  /* PA0 former MOTION_INT — now an idle input with pull-down so the unused
+   * BMA253 INT1 line cannot float and generate spurious activity. */
+  GPIO_InitStruct.Pin = MOTION_INT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* BLE_STATE (PA15, JDY-23 link line) — interrupt on BOTH edges so a
+   * connect (rising) or disconnect (falling) is delivered as an event
+   * instead of being polled. This is the "Bluetooth packet" wake source
+   * that took over the EXTI slot previously used by the IMU. */
+  GPIO_InitStruct.Pin = BLE_STATE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = HX711_DOUT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -445,13 +465,17 @@ static void MX_GPIO_Init(void)
 
 #ifndef BRINGUP_TEST_MODE
 
-/* GPIO EXTI: BMA253 motion (PA0) and PCF8563/DS3231 1 Hz tick (PA11). */
+/* GPIO EXTI:
+ *   PA11 RTC_INT   — PCF8563 1 Hz tick.
+ *   PA15 BLE_STATE — JDY-23 link up/down edge (replaces the old IMU motion
+ *                    interrupt on PA0). Forwarded to the app so connect /
+ *                    disconnect is handled as an event, not by polling. */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (GPIO_Pin == MOTION_INT_Pin) {
-    App_BMA_MotionISR();
-  } else if (GPIO_Pin == RTC_INT_Pin) {
+  if (GPIO_Pin == RTC_INT_Pin) {
     App_RTC_TickISR();
+  } else if (GPIO_Pin == BLE_STATE_Pin) {
+    App_BLE_LinkISR();
   }
 }
 

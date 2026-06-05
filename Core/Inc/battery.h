@@ -36,6 +36,7 @@ typedef struct {
 void    Battery_Init(Battery_Handle_t *hbat, ADC_HandleTypeDef *hadc);
 void    Battery_Update(Battery_Handle_t *hbat);
 uint8_t Battery_GetPercent(Battery_Handle_t *hbat);
+uint16_t Battery_GetVoltageMv(Battery_Handle_t *hbat);
 uint8_t Battery_IsCharging(Battery_Handle_t *hbat);
 uint8_t Battery_IsFull(Battery_Handle_t *hbat);
 uint8_t Battery_IsLow(Battery_Handle_t *hbat);

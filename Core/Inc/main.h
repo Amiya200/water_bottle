@@ -85,6 +85,7 @@ void Error_Handler(void);
 #define RTC_INT_EXTI_IRQn EXTI4_15_IRQn
 #define BLE_STATE_Pin GPIO_PIN_15
 #define BLE_STATE_GPIO_Port GPIOA
+#define BLE_STATE_EXTI_IRQn EXTI4_15_IRQn
 #define BUZZER_Pin GPIO_PIN_5
 #define BUZZER_GPIO_Port GPIOB
 #define BUTTON_Pin GPIO_PIN_3

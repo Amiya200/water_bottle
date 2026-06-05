@@ -144,6 +144,9 @@ void SysTick_Handler(void)
 
 /**
   * @brief This function handles EXTI line 0 and 1 interrupts.
+  * @note  PA0 (former BMA253 MOTION_INT) is no longer an interrupt source.
+  *        This handler is retained for the vector table but clears any
+  *        stray pending flag defensively.
   */
 void EXTI0_1_IRQHandler(void)
 {
@@ -158,6 +161,8 @@ void EXTI0_1_IRQHandler(void)
 
 /**
   * @brief This function handles EXTI line 4 to 15 interrupts.
+  * @note  Services BOTH the PCF8563 1 Hz tick on PA11 and the JDY-23
+  *        BLE link-state line on PA15.
   */
 void EXTI4_15_IRQHandler(void)
 {
@@ -165,6 +170,7 @@ void EXTI4_15_IRQHandler(void)
 
   /* USER CODE END EXTI4_15_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(RTC_INT_Pin);
+  HAL_GPIO_EXTI_IRQHandler(BLE_STATE_Pin);
   /* USER CODE BEGIN EXTI4_15_IRQn 1 */
 
   /* USER CODE END EXTI4_15_IRQn 1 */
