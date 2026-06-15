@@ -15,9 +15,31 @@
 #define APP_BUTTON_POLL_MS        50U
 
 /* ─── Physical button ───────────────────────────────────────── */
+/* FRD §8.3 semantics:
+ * release < 3 s            → short press: wake / status / confirm
+ * 3 s ≤ release < 10 s     → long press: power on/off (soft)
+ * hold ≥ 10 s              → factory-reset warning (5 s, cancellable)
+ * keep holding +5 s        → factory reset executes
+ */
 #define BTN_LONG_PRESS_MS       3000U
 #define BTN_VLONG_PRESS_MS     10000U
 #define BTN_RESET_CONFIRM_MS    5000U
+
+/* App-triggered factory reset: non-blocking 5 s warning window (FRD §8.2) */
+#define APP_FRESET_WARN_MS      5000U
+
+/* Internal error log (FRD ERROR_LOG) */
+#define APP_ERRLOG_DEPTH        6U
+#define APP_ERR_HX711           1U
+#define APP_ERR_RTC             2U
+#define APP_ERR_EEPROM          3U
+#define APP_ERR_TDS             4U
+#define APP_ERR_NTC             5U
+
+/* Preference validation limits (FRD ACK error example) */
+#define PREF_PURITY_MAX_PPM     1500U   /* "must be between 0 and 1500" */
+#define PREF_TEMP_MAX_X10       1000    /* 100.0 °C                      */
+#define PREF_HYDRATION_MAX_ML   10000U
 
 /* ─── Drink detection ───────────────────────────────────────── */
 #define DRINK_MIN_VOLUME_ML     10U
@@ -74,11 +96,12 @@ void App_Cmd_InputData(const BLE_Packet_t *pkt);
 void App_Cmd_Calibration(const BLE_Packet_t *pkt);
 void App_Cmd_LampMode(const BLE_Packet_t *pkt);
 void App_Cmd_SoftReset(void);
-void App_Cmd_FactoryReset(void);
+void App_Cmd_FactoryReset(void);                          /* immediate wipe (button path)    */
+void App_Cmd_FactoryResetRequest(const BLE_Packet_t *pkt);/* BLE path: 5 s warn, cancellable */
 void App_Cmd_HistoricalAggregates(void);
 void App_Cmd_RegisterDevice(const BLE_Packet_t *pkt);
 void App_Cmd_UnpairDevice(void);
-void App_Cmd_SensorLogs(void);
+void App_Cmd_SensorLogs(const BLE_Packet_t *pkt);  /* optional from/to unix filter */
 void App_Cmd_SyncAck(const BLE_Packet_t *pkt);
 void App_Cmd_DeviceStatus(void);
 void App_Cmd_GetConfig(void);
@@ -86,6 +109,14 @@ void App_Cmd_GetErrors(void);
 void App_Cmd_Ping(void);
 void App_Cmd_Measure(uint8_t force);
 void App_Cmd_DumpEEPROM(void);
+void App_Cmd_GetInfo(void);
+void App_Cmd_FirmwareUpdate(const BLE_Packet_t *pkt);
+
+/* PRD §3: auto-transfer of unsynced data when the app connects. */
+void App_PushUnsyncedLogs(void);
+
+/* Append to the internal error ring + show the error LED cue (FRD §5.12). */
+void App_LogError(uint8_t code);
 
 void App_SendACK(uint8_t cmd_id, uint8_t success, uint8_t err_code);
 

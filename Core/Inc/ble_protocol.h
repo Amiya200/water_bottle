@@ -45,8 +45,20 @@
  * NOTE: BLE_PKT_MAX_LEN is derived here — do NOT redefine it in other
  * headers (ble_jdy29.h no longer defines it).
  */
-#define BLE_PKT_MAX_PAYLOAD     20U
-#define BLE_PKT_MAX_LEN         (5U + BLE_PKT_MAX_PAYLOAD)   /* = 25 */
+/* PRD v2 FIX: BLE_CMD_REGISTER carries 16 B user_id + 16 B nickname = 32 B.
+ * With MAX_PAYLOAD = 20 the parser rejected every registration frame and the
+ * nickname branch in App_Cmd_RegisterDevice was dead code. Registration is a
+ * mandatory first-time-setup flow (FRD §4), so the limit is 32.
+ * Cost: +12 B in BLE_Handle_t.pkt_buf and +12 B per stack BLE_Packet_t. */
+#define BLE_PKT_MAX_PAYLOAD     32U
+#define BLE_PKT_MAX_LEN         (5U + BLE_PKT_MAX_PAYLOAD)   /* = 37 */
+
+/* ─── Firmware identity (FRD §2.2 command metadata) ─────────────────── */
+#define HYDRA_FW_VER_MAJOR      2U
+#define HYDRA_FW_VER_MINOR      0U
+#define HYDRA_FW_VER_PATCH      0U
+#define HYDRA_MODEL_ID          0x01U   /* HydraSense-Pro-v1 */
+#define HYDRA_PROTO_VER         2U      /* this command set  */
 
 /* ─── Command IDs (host → device) ───────────────────────────────────────── */
 #define BLE_CMD_TIMESTAMP       0x01U
@@ -67,6 +79,8 @@
 #define BLE_CMD_MEASURE         0x10U   /* load cell → conditional TDS/temp → store */
 #define BLE_CMD_STORE_WEIGHT    0x11U   /* force-store a weight record              */
 #define BLE_CMD_DUMP_EEPROM     0x12U   /* stream all EEPROM records                */
+#define BLE_CMD_FW_UPDATE       0x13U   /* FRD FIRMWARE_UPDATE — OTA notification   */
+#define BLE_CMD_GET_INFO        0x14U   /* fw version / model identity (FRD §2.2)   */
 
 /* ─── Response IDs (device → host) ──────────────────────────────────────── */
 #define BLE_RSP_ACK             0x80U
@@ -78,12 +92,15 @@
 #define BLE_RSP_ERR_LOG         0x86U
 #define BLE_RSP_EE_RECORD       0x87U   /* one EEPROM measurement record */
 #define BLE_RSP_MEASURE         0x88U   /* MEASURE/STORE_WEIGHT result   */
+#define BLE_RSP_INFO            0x89U   /* reply to BLE_CMD_GET_INFO     */
 
 /* ─── Error codes ────────────────────────────────────────────────────────── */
 #define BLE_ERR_OK              0x00U
 #define BLE_ERR_UNKNOWN_CMD     0x01U
 #define BLE_ERR_INVALID_STAGE   0x02U
 #define BLE_ERR_NOT_CHARGING    0x03U
+#define BLE_ERR_UNSUPPORTED     0x04U   /* command known but not available  */
+#define BLE_ERR_INVALID_VALUE   0x05U   /* FRD ACK example: range-check fail */
 
 /* ─── Status flags ───────────────────────────────────────────────────────── */
 #define BLE_FLAG_CHARGING       0x01U
@@ -107,11 +124,30 @@ typedef struct {
 } BLE_Packet_t;
 
 /* ─── Payload structs ────────────────────────────────────────────────────── */
+/* FRD DEVICE_STATUS response: battery, charging/sensor/calibration flags,
+ * storage use, last_sync timestamp and running firmware version. */
 typedef struct {
     uint8_t bat_pct;
     uint8_t flags;
     uint8_t storage_pct;
-} BLE_StatusPayload_t;
+    uint8_t sync_b3, sync_b2, sync_b1, sync_b0;  /* last_sync unix; 0 = never since boot */
+    uint8_t fw_major, fw_minor, fw_patch;
+} BLE_StatusPayload_t;                            /* 10 bytes */
+
+/* One internal error-log entry (FRD ERROR_LOG). */
+typedef struct {
+    uint8_t unix_b3, unix_b2, unix_b1, unix_b0;
+    uint8_t code;                                 /* APP_ERR_* */
+} BLE_ErrEntryPayload_t;                          /* 5 bytes */
+
+/* GET_INFO reply (FRD §2.2 metadata: fw version + model for compat checks). */
+typedef struct {
+    uint8_t fw_major, fw_minor, fw_patch;
+    uint8_t model_id;
+    uint8_t proto_ver;
+    uint8_t max_daily_days;                       /* 30 (PRD §7.1)           */
+    uint8_t max_drink_events;
+} BLE_InfoPayload_t;                              /* 7 bytes */
 
 typedef struct {
     uint8_t unix_b3, unix_b2, unix_b1, unix_b0;
@@ -152,6 +188,8 @@ uint8_t BLE_BuildStatus(uint8_t *buf, const BLE_StatusPayload_t *s);
 uint8_t BLE_BuildLogEntry(uint8_t *buf, const BLE_LogEntryPayload_t *e);
 uint8_t BLE_BuildDaily(uint8_t *buf, const BLE_DailyPayload_t *d);
 uint8_t BLE_BuildEERecord(uint8_t *buf, const BLE_EERecordPayload_t *r);
+uint8_t BLE_BuildErrEntry(uint8_t *buf, const BLE_ErrEntryPayload_t *e);
+uint8_t BLE_BuildInfo(uint8_t *buf, const BLE_InfoPayload_t *i);
 
 /* BLE_BuildConfig needs BLE_PrefsPayload_t — declared in data_storage.h */
 struct BLE_PrefsPayload_t;

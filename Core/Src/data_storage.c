@@ -134,6 +134,24 @@ void Storage_MarkSynced(DrinkLog_t *log, uint32_t synced_up_to_unix)
     log->dirty = 1;
 }
 
+/* FRD §7.1 — free space after a successful sync. Today's events are kept
+ * (cutoff = today's midnight) because Storage_UpdateDailySummary recomputes
+ * the current day's totals from the detailed log. */
+void Storage_PurgeSyncedBefore(DrinkLog_t *log, uint32_t cutoff_unix)
+{
+    uint8_t kept = 0;
+    for (uint8_t i = 0; i < log->count; i++) {
+        if (log->events[i].synced && log->events[i].unix_time < cutoff_unix)
+            continue;                      /* synced + old → drop            */
+        if (kept != i) log->events[kept] = log->events[i];
+        kept++;
+    }
+    if (kept != log->count) {
+        log->count = kept;
+        log->dirty = 1;
+    }
+}
+
 /* ─── Daily summary ──────────────────────────────────────────────────────── */
 void Storage_UpdateDailySummary(DailySummaryLog_t *daily,
                                  DrinkLog_t        *log,

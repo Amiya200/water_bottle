@@ -83,8 +83,21 @@ uint8_t BLE_BuildPong(uint8_t *buf)
 
 uint8_t BLE_BuildStatus(uint8_t *buf, const BLE_StatusPayload_t *s)
 {
-    uint8_t p[3] = { s->bat_pct, s->flags, s->storage_pct };
-    return BLE_BuildPacket(buf, BLE_RSP_STATUS, p, 3);
+    /* Struct is all-uint8_t — no padding, safe to send as raw bytes. */
+    return BLE_BuildPacket(buf, BLE_RSP_STATUS, (const uint8_t *)s,
+                           (uint8_t)sizeof(BLE_StatusPayload_t));
+}
+
+uint8_t BLE_BuildErrEntry(uint8_t *buf, const BLE_ErrEntryPayload_t *e)
+{
+    return BLE_BuildPacket(buf, BLE_RSP_ERR_LOG, (const uint8_t *)e,
+                           (uint8_t)sizeof(BLE_ErrEntryPayload_t));
+}
+
+uint8_t BLE_BuildInfo(uint8_t *buf, const BLE_InfoPayload_t *i)
+{
+    return BLE_BuildPacket(buf, BLE_RSP_INFO, (const uint8_t *)i,
+                           (uint8_t)sizeof(BLE_InfoPayload_t));
 }
 
 uint8_t BLE_BuildLogEntry(uint8_t *buf, const BLE_LogEntryPayload_t *e)

@@ -6,26 +6,34 @@
  *
  * DEBUG globals (add ALL to STM32CubeIDE Live Expressions):
  *   g_ntc_raw_adc       → raw 12-bit ADC count (0-4095)
- *   g_ntc_adc_avg       → averaged ADC (4 samples)
+ *   g_ntc_adc_avg       → averaged ADC (good samples only)
  *   g_ntc_lut_idx       → which LUT segment was selected
  *   g_ntc_frac          → interpolation fraction (0-100)
  *   g_ntc_temp_x10      → final temperature ×10  (e.g. 253 = 25.3 °C)
  *   g_ntc_fault         → fault code (see enum below)
+ *   g_ntc_good_samples  → how many of the 4 samples were usable
  *   g_ntc_chselr_before → CHSELR value BEFORE our clear
  *   g_ntc_chselr_after  → CHSELR value AFTER clear+config (must be 0x08)
  *
  * Fault codes  (g_ntc_fault):
  *   0 = OK
- *   1 = adc_avg < 10     → NTC open circuit or PA3 floating
- *   2 = adc_avg > 4085   → NTC/pin shorted to 3V3
- *   3 = idx clamped      → temperature above 80 °C (LUT max)
+ *   1 = adc_avg < 10        → NTC open circuit or PA3 floating
+ *   2 = adc_avg > 4085      → NTC/pin shorted to 3V3
+ *   3 = idx clamped HIGH    → temperature above 80 °C (LUT max)
  *   4 = frac out of range
- *   5 = HAL_ADC_PollForConversion timeout
+ *   5 = HAL_ADC_PollForConversion timeout (per-sample, discarded)
+ *   6 = idx clamped LOW     → temperature below -5 °C (LUT min)   [NEW]
+ *   7 = all 4 samples timed out → no usable reading              [NEW]
  * ============================================================================
  */
 #pragma GCC optimize("Os")
 
 #include "ntc_temp.h"
+
+/* Per-sample timeout sentinel returned by NTC_ReadADC. 0xFFFF can never be a
+ * valid 12-bit ADC result (max 4095), so the averaging loop can reliably
+ * detect and discard a timed-out sample without relying on the debug fault. */
+#define NTC_ADC_TIMEOUT_SENTINEL  0xFFFFU
 
 /* ── Debug globals — watch ALL of these in Live Expressions ─────────────── */
 #ifdef NTC_DEBUG_VARS
@@ -35,6 +43,7 @@ volatile uint8_t  g_ntc_lut_idx        = 0;
 volatile int32_t  g_ntc_frac           = 0;
 volatile int16_t  g_ntc_temp_x10       = 0;
 volatile uint8_t  g_ntc_fault          = 0;
+volatile uint8_t  g_ntc_good_samples   = 0;
 volatile uint32_t g_ntc_chselr_before  = 0;
 volatile uint32_t g_ntc_chselr_after   = 0;
 #define NTC_DBG_SET(name, value) do { (name) = (value); } while (0)
@@ -49,6 +58,7 @@ volatile uint32_t g_ntc_chselr_after   = 0;
  * Formula: ADC = round(4096 * R_NTC / (10000 + R_NTC))
  *          R_NTC = 10000 * exp(3950*(1/(T+273.15) - 1/298.15))
  * Range: -5 to 80 °C, step 5 °C, 18 entries
+ * Table is MONOTONIC DESCENDING in ADC: s_ntc_lut[0] is the largest count.
  *
  * Index   Temp(°C)   ADC
  *   0       -5       3338
@@ -78,6 +88,7 @@ static const uint16_t s_ntc_lut[NTC_LUT_ENTRIES] = {
 
 /* ===========================================================================
  * Internal: read one ADC sample from CH3 only
+ * Returns the 12-bit count, or NTC_ADC_TIMEOUT_SENTINEL (0xFFFF) on timeout.
  * ===========================================================================
  */
 static uint16_t NTC_ReadADC(NTC_Handle_t *hntc)
@@ -89,9 +100,14 @@ static uint16_t NTC_ReadADC(NTC_Handle_t *hntc)
 
     /* ── CRITICAL FIX ────────────────────────────────────────────────────
      * HAL_ADC_ConfigChannel does CHSELR |= channel_bit, never clears.
-     * After MX_ADC_Init, CH2+CH3+CH7 are ALL set.
-     * Forward-scan returns CH2 first → wrong pin → garbage temperature.
-     * Write 0 here so ONLY CH3 is selected for this conversion.          */
+     * After MX_ADC_Init, CH2+CH3+CH7 are ALL set, and the TDS / battery
+     * readers each select their own channel the same way. Whichever driver
+     * configured last would otherwise win. Write 0 here so ONLY CH3 is
+     * selected for THIS conversion.
+     *
+     * NB: TDS_ReadPPM() and Battery_Update() MUST perform the identical
+     * "CHSELR = 0" before their own ConfigChannel, or interleaved polling
+     * in App_Run() will corrupt each other's readings.                    */
     hntc->hadc->Instance->CHSELR = 0U;
 
     sConfig.Channel      = ADC_CHANNEL_3;             /* PA3 = NTC_TEMP     */
@@ -107,8 +123,8 @@ static uint16_t NTC_ReadADC(NTC_Handle_t *hntc)
     if (HAL_ADC_PollForConversion(hntc->hadc, 10U) != HAL_OK) {
         HAL_ADC_Stop(hntc->hadc);
         NTC_DBG_SET(g_ntc_fault, 5U);
-        NTC_DBG_SET(g_ntc_raw_adc, 9999U);   /* sentinel: timeout */
-        return 2048U;
+        NTC_DBG_SET(g_ntc_raw_adc, 9999U);          /* sentinel: timeout */
+        return NTC_ADC_TIMEOUT_SENTINEL;            /* discarded by caller */
     }
 
     uint16_t val = (uint16_t)HAL_ADC_GetValue(hntc->hadc);
@@ -138,13 +154,31 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
 {
     NTC_DBG_SET(g_ntc_fault, 0U);
 
-    /* ── 1. Average 4 samples ────────────────────────────────────────── */
-    uint32_t sum = 0U;
+    /* ── 1. Average up to 4 samples, DISCARDING timeouts ─────────────────
+     * A timed-out sample used to be silently substituted with 2048 (≈25 °C),
+     * which dragged the average toward room temperature and masked the fault.
+     * Now bad samples are dropped and only good ones are averaged.        */
+    uint32_t sum  = 0U;
+    uint8_t  good = 0U;
     for (uint8_t i = 0U; i < 4U; i++) {
-        sum += NTC_ReadADC(hntc);
+        uint16_t s = NTC_ReadADC(hntc);
+        if (s != NTC_ADC_TIMEOUT_SENTINEL) {
+            sum += s;
+            good++;
+        }
         HAL_Delay(2);
     }
-    uint16_t adc_avg = (uint16_t)(sum >> 2);
+    NTC_DBG_SET(g_ntc_good_samples, good);
+
+    if (good == 0U) {
+        /* Every sample timed out → ADC stuck / not converting. Hold last
+         * value, flag the reading invalid so App_TaskTemp() logs the fault. */
+        NTC_DBG_SET(g_ntc_fault, 7U);
+        hntc->valid = 0;
+        return hntc->last_temp_x10;
+    }
+
+    uint16_t adc_avg = (uint16_t)(sum / good);
     NTC_DBG_SET(g_ntc_adc_avg, adc_avg);
 
     /* ── 2. Fault detection ──────────────────────────────────────────── */
@@ -159,17 +193,31 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
         return hntc->last_temp_x10;
     }
 
-    /* ── 3. LUT search ───────────────────────────────────────────────── */
-    uint8_t idx = 0U;
-    for (; idx < (NTC_LUT_ENTRIES - 1U); idx++) {
-        if (adc_avg >= s_ntc_lut[idx + 1U]) {
-            break;
-        }
-    }
-
-    if (idx >= (NTC_LUT_ENTRIES - 1U)) {
-        idx = NTC_LUT_ENTRIES - 2U;
+    /* ── 3. LUT search — properly bracketed ──────────────────────────────
+     * Table is DESCENDING in ADC. We want idx such that
+     *     s_ntc_lut[idx] >= adc_avg >= s_ntc_lut[idx+1].
+     *
+     * The previous loop only tested the lower edge (adc_avg >= lut[idx+1])
+     * and never validated the upper edge, so any out-of-range count was
+     * either silently extrapolated (cold side) or pinned to 80 °C with the
+     * same fault code as genuine heat. This version handles both clamps
+     * explicitly with distinct fault codes (3 = too hot, 6 = too cold).  */
+    uint8_t idx;
+    if (adc_avg >= s_ntc_lut[0]) {
+        /* Count higher than the -5 °C entry → colder than the LUT minimum. */
+        idx = 0U;
+        NTC_DBG_SET(g_ntc_fault, 6U);
+    } else if (adc_avg <= s_ntc_lut[NTC_LUT_ENTRIES - 1U]) {
+        /* Count lower than the 80 °C entry → hotter than the LUT maximum. */
+        idx = (uint8_t)(NTC_LUT_ENTRIES - 2U);
         NTC_DBG_SET(g_ntc_fault, 3U);
+    } else {
+        /* In range: find the bracketing segment. */
+        for (idx = 0U; idx < (uint8_t)(NTC_LUT_ENTRIES - 2U); idx++) {
+            if (adc_avg >= s_ntc_lut[idx + 1U]) {
+                break;
+            }
+        }
     }
     NTC_DBG_SET(g_ntc_lut_idx, idx);
 
@@ -179,9 +227,9 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
     int32_t t_hi_x10  = ((int32_t)NTC_LUT_TEMP_MIN
                          + (int32_t)(idx + 1U) * (int32_t)NTC_LUT_TEMP_STEP) * 10;
 
-    int32_t adc_lo    = (int32_t)s_ntc_lut[idx];
-    int32_t adc_hi    = (int32_t)s_ntc_lut[idx + 1U];
-    int32_t adc_range = adc_lo - adc_hi;
+    int32_t adc_lo    = (int32_t)s_ntc_lut[idx];        /* larger count  */
+    int32_t adc_hi    = (int32_t)s_ntc_lut[idx + 1U];   /* smaller count */
+    int32_t adc_range = adc_lo - adc_hi;                /* positive      */
 
     if (adc_range == 0) {
         hntc->last_temp_x10 = (int16_t)t_lo_x10;
@@ -203,6 +251,9 @@ int16_t NTC_ReadTemp_x10(NTC_Handle_t *hntc)
     int32_t temp_x10 = t_lo_x10 + ((t_hi_x10 - t_lo_x10) * frac) / 100;
 
     hntc->last_temp_x10 = (int16_t)temp_x10;
+    /* A clamped reading (fault 3/6) is a real out-of-range condition, not a
+     * dropout — return the boundary temperature but keep valid=1 so it is
+     * still reported. Only open/short/timeout mark the reading invalid.   */
     hntc->valid         = 1;
     NTC_DBG_SET(g_ntc_temp_x10, hntc->last_temp_x10);
 

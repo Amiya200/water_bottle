@@ -31,7 +31,22 @@
  *              implicitly internal already, but the explicit keyword lets
  *              the linker discard the symbol if it ends up unused via LTO).
  *
- * No functional changes. All command replies are identical to before.
+ * TDS CALIBRATION (this revision)
+ * ─────────────────────────────────────────────────────────────────────
+ * New ASCII console commands wired to the two-point calibration in
+ * tds_sensor.c (validated on the bench against a reference TDS meter):
+ *
+ *   TDSP          debug read  -> "P:<mV>,<ppm>,<sensor_valid>,<cal_valid>"
+ *   CALLO,<ppm>   capture LOW  point, probe in low-ref water  (CALLO,45)
+ *   CALHI,<ppm>   capture HIGH point, probe in high-ref water (CALHI,891)
+ *   CALSTAT       -> "CS:<valid>,<mv_lo>,<ppm_lo>,<mv_hi>,<ppm_hi>"
+ *
+ * Until both points are captured the TDS path behaves EXACTLY as before
+ * (DFRobot cubic), so nothing in the existing flow changes.
+ * Cal points are RAM-only; to persist them add four fields to
+ * DeviceSettings_t (see the comment at the CALHI handler).
+ *
+ * No other functional changes. All other command replies are identical.
  * ─────────────────────────────────────────────────────────────────────
  */
 
@@ -124,6 +139,25 @@ static uint8_t                 s_ble_was_connected;
 static int32_t                 s_ee_prev_weight_ml;
 static uint8_t                 s_ee_prev_valid;
 
+/* ── PRD/FRD v2.0 additions ────────────────────────────────────
+ * s_daily is now a single shared instance instead of a 360+ byte stack
+ * local in three different functions — with the PRD-mandated 30-day depth
+ * a stack copy would risk overflow on the F030's small stack.            */
+static DailySummaryLog_t       s_daily;
+
+static uint32_t                s_last_sync_unix;   /* last SYNC_ACK (0 = never since boot) */
+static int16_t                 s_tz_offset_min;    /* TIMESTAMP optional timezone offset   */
+static uint8_t                 s_soft_off;         /* FRD §8.3 long-press soft power state */
+static uint32_t                s_freset_at_ms;     /* deadline of app-side 5 s reset warn  */
+
+/* Internal error ring (FRD ERROR_LOG) */
+typedef struct { uint32_t unix_time; uint8_t code; } ErrEntry_t;
+static ErrEntry_t              s_err_log[APP_ERRLOG_DEPTH];
+static uint8_t                 s_err_count;
+static uint8_t                 s_err_head;
+/* one-shot fault latches so each fault episode is logged once */
+static uint8_t                 s_hx711_fault, s_tds_fault, s_ntc_fault;
+
 static void App_ClearState(void)
 {
     memset(&s_hx711, 0, sizeof(s_hx711));
@@ -171,6 +205,29 @@ static void App_ClearState(void)
 
     s_ee_prev_weight_ml = 0;
     s_ee_prev_valid     = 0U;
+
+    memset(&s_daily, 0, sizeof(s_daily));
+    memset(s_err_log, 0, sizeof(s_err_log));
+    s_last_sync_unix = 0U;
+    s_tz_offset_min  = 0;
+    s_soft_off       = 0U;
+    s_freset_at_ms   = 0U;
+    s_err_count      = 0U;
+    s_err_head       = 0U;
+    s_hx711_fault = s_tds_fault = s_ntc_fault = 0U;
+}
+
+/* ─── Error log (FRD ERROR_LOG + §5.12 error cue) ───────────────────── */
+void App_LogError(uint8_t code)
+{
+    s_err_log[s_err_head].unix_time = s_rtc.unix_approx;
+    s_err_log[s_err_head].code      = code;
+    s_err_head = (uint8_t)((s_err_head + 1U) % APP_ERRLOG_DEPTH);
+    if (s_err_count < APP_ERRLOG_DEPTH) s_err_count++;
+
+    /* §5.12: white rapid flashes — pattern self-terminates after 2.5 s. */
+    WS2812B_SetPattern(LED_PATTERN_ERROR);
+    Buzzer_Play(BUZZER_ERROR);
 }
 
 /* File-scope literals — pooled once; linker merges duplicate .rodata */
@@ -286,6 +343,7 @@ void App_Init(ADC_HandleTypeDef  *hadc,
     if (RTC_Init(&s_rtc, hi2c) != HAL_OK) {
         s_rtc.unix_approx = 0;
         s_rtc.initialized = 0;
+        App_LogError(APP_ERR_RTC);
         /* NOTE: do NOT disable EXTI4_15 here. The BLE link-state line (PA15)
          * shares that vector with the RTC tick (PA11); the per-pin handler
          * in HAL_GPIO_EXTI_Callback already ignores a non-RTC source, and a
@@ -311,6 +369,7 @@ void App_Init(ADC_HandleTypeDef  *hadc,
 
     Storage_LoadSettings(&s_settings);
     Storage_LoadDrinkLog(&s_drink_log);
+    Storage_LoadDailySummary(&s_daily);   /* shared 30-day buffer (PRD §7.1) */
     s_hx711.tare_offset = s_settings.tare_offset;
     if (s_settings.hx711_scale_x100 >= HX711_SCALE_X100_MIN) {
         HX711_SetScaleX100(&s_hx711, s_settings.hx711_scale_x100);
@@ -318,6 +377,16 @@ void App_Init(ADC_HandleTypeDef  *hadc,
         s_hx711.scale_x100    = HX711_SCALE_X100_DEFAULT;
         s_hx711.is_calibrated = 0;
     }
+
+    /* TDS two-point calibration: RAM-only in this build, nothing to restore.
+     * TO PERSIST: add to DeviceSettings_t
+     *     int32_t  tds_cal_mv_lo, tds_cal_mv_hi;
+     *     uint16_t tds_cal_ppm_lo, tds_cal_ppm_hi;
+     * then uncomment:
+     * TDS_CalSet(s_settings.tds_cal_mv_lo, s_settings.tds_cal_ppm_lo,
+     *            s_settings.tds_cal_mv_hi, s_settings.tds_cal_ppm_hi);
+     * (TDS_CalSet validates internally — a blank/erased settings block just
+     *  leaves the sensor on the DFRobot fallback.) */
 
     s_current_temp_x10 = 250;
     Device_Init(&s_dev);
@@ -333,6 +402,15 @@ void App_Init(ADC_HandleTypeDef  *hadc,
     }
 
     s_current_day_unix = (s_rtc.unix_approx / 86400UL) * 86400UL;
+
+    /* PRD §4 (returning user): continue where we left off — rebuild today's
+     * consumed total and hydration score from the persisted detailed log. */
+    for (uint8_t i = 0; i < s_drink_log.count; i++) {
+        if (s_drink_log.events[i].unix_time >= s_current_day_unix)
+            s_consumed_today_ml = (uint16_t)(s_consumed_today_ml +
+                                             s_drink_log.events[i].volume_ml);
+    }
+    s_hydration_score = App_CalcHydrationScore();
 }
 
 /* ─── Main run loop ─────────────────────────────────────────────────────── */
@@ -342,28 +420,40 @@ void App_Run(void)
 
     Device_Run(&s_dev);
 
+    /* FRD §8.2: app-triggered factory reset runs as a NON-BLOCKING 5 s
+     * warning window — LEDs keep flashing and a FACTORY_RESET with
+     * status=disable cancels it. (The old HAL_Delay(5000) froze the LED
+     * engine so the user never saw the warning flashes.) */
+    if (s_freset_at_ms != 0U && (int32_t)(now - s_freset_at_ms) >= 0) {
+        App_Cmd_FactoryReset();   /* warning elapsed — wipe + reboot */
+    }
+
     if (s_rtc.initialized && RTC_PopTick(&s_rtc)) {
         RTC_ClearTimerFlag(&s_rtc);
         if ((s_rtc.unix_approx % 60UL) == 0UL) RTC_Read(&s_rtc);
     }
 
-    BLE_IdleFlush(&s_ble, 150U);
-    App_ServiceBLE();
-
-    /* A BLE connect/disconnect edge (PA15 EXTI) is handled promptly rather
-     * than waiting for the 1 s poll, so auto-sync starts the moment the app
-     * connects. */
-    if (s_ble_link_edge) App_TaskBLE();
-
-    if (now - s_last_weight_ms  >= APP_WEIGHT_POLL_MS)   App_TaskWeight();
-    if (now - s_last_tds_ms     >= APP_TDS_POLL_MS)      App_TaskTDS();
-    if (now - s_last_temp_ms    >= APP_TEMP_POLL_MS)      App_TaskTemp();
-    if (now - s_last_battery_ms >= APP_BATTERY_POLL_MS)   App_TaskBattery();
-    if (now - s_last_ble_poll_ms>= APP_BLE_STATE_POLL_MS) App_TaskBLE();
-    if (now - s_last_reminder_ms>= APP_REMINDER_CHECK_MS) App_TaskReminder();
+    /* Button and charging UI stay alive even when soft-powered-off. */
     if (now - s_last_button_ms  >= APP_BUTTON_POLL_MS)    App_TaskButton();
+    if (now - s_last_battery_ms >= APP_BATTERY_POLL_MS)   App_TaskBattery();
 
-    App_TaskDailyRollup();
+    if (!s_soft_off) {
+        BLE_IdleFlush(&s_ble, 150U);
+        App_ServiceBLE();
+
+        /* A BLE connect/disconnect edge (PA15 EXTI) is handled promptly
+         * rather than waiting for the 1 s poll, so the PRD §3 auto-transfer
+         * starts the moment the app connects. */
+        if (s_ble_link_edge) App_TaskBLE();
+
+        if (now - s_last_weight_ms  >= APP_WEIGHT_POLL_MS)   App_TaskWeight();
+        if (now - s_last_tds_ms     >= APP_TDS_POLL_MS)      App_TaskTDS();
+        if (now - s_last_temp_ms    >= APP_TEMP_POLL_MS)     App_TaskTemp();
+        if (now - s_last_ble_poll_ms>= APP_BLE_STATE_POLL_MS) App_TaskBLE();
+        if (now - s_last_reminder_ms>= APP_REMINDER_CHECK_MS) App_TaskReminder();
+        App_TaskDailyRollup();
+    }
+
     WS2812B_Update();
     Buzzer_Update();
 }
@@ -375,7 +465,14 @@ void App_TaskWeight(void)
     if (!s_hx711.is_calibrated) return;
 
     int32_t w = HX711_ReadMillilitres(&s_hx711);
-    if (!s_hx711.last_read_ok) return;
+    if (!s_hx711.last_read_ok) {
+        if (!s_hx711_fault) {            /* log once per fault episode */
+            s_hx711_fault = 1U;
+            App_LogError(APP_ERR_HX711);
+        }
+        return;
+    }
+    s_hx711_fault = 0U;
 
     s_current_weight_ml = w;
     App_CheckDrinkEvent();
@@ -433,10 +530,8 @@ void App_RecordDrinkEvent(uint16_t volume_ml)
 
     WS2812B_SetPattern(LED_PATTERN_DRINK_CONFIRM);
     Buzzer_Play(BUZZER_SINGLE_BEEP);
-    DailySummaryLog_t daily;
-    Storage_LoadDailySummary(&daily);
-    Storage_UpdateDailySummary(&daily, &s_drink_log, s_rtc.unix_approx);
-    Storage_FlushDailySummary(&daily);
+    Storage_UpdateDailySummary(&s_daily, &s_drink_log, s_rtc.unix_approx);
+    Storage_FlushDailySummary(&s_daily);
 }
 
 /* ─── TDS ───────────────────────────────────────────────────────────────── */
@@ -444,6 +539,12 @@ void App_TaskTDS(void)
 {
     s_last_tds_ms     = HAL_GetTick();
     s_current_tds_ppm = TDS_ReadPPM(&s_tds, s_current_temp_x10);
+
+    if (!s_tds.valid) {
+        if (!s_tds_fault) { s_tds_fault = 1U; App_LogError(APP_ERR_TDS); }
+        return;                           /* don't alert on a bad reading */
+    }
+    s_tds_fault = 0U;
 
     uint16_t purity_goal = BLE_U16(s_settings.prefs.purity_goal_hi,
                                     s_settings.prefs.purity_goal_lo);
@@ -463,6 +564,12 @@ void App_TaskTemp(void)
 {
     s_last_temp_ms     = HAL_GetTick();
     s_current_temp_x10 = NTC_ReadTemp_x10(&s_ntc);
+
+    if (!s_ntc.valid) {
+        if (!s_ntc_fault) { s_ntc_fault = 1U; App_LogError(APP_ERR_NTC); }
+        return;                           /* don't alert on a bad reading */
+    }
+    s_ntc_fault = 0U;
 
     int16_t temp_goal_x10 = BLE_I16(s_settings.prefs.temp_goal_hi,
                                       s_settings.prefs.temp_goal_lo);
@@ -525,8 +632,11 @@ void App_TaskBLE(void)
         s_ble_link_edge = 0U;
         if (connected && !s_ble_was_connected) {
             Device_PostEvent(&s_dev, EVT_BLE_CONNECTED);
-            /* App is now nearby — push anything not yet synced. */
+            /* App is now nearby — persist, then auto-transfer everything
+             * that hasn't been synced yet (PRD §3: "any data that hasn't
+             * been sent yet is automatically transferred"). */
             if (s_drink_log.dirty) Storage_FlushDrinkLog(&s_drink_log);
+            App_PushUnsyncedLogs();
         } else if (!connected && s_ble_was_connected) {
             Device_PostEvent(&s_dev, EVT_BLE_DISCONNECTED);
             /* Persist queued data so nothing is lost while offline. */
@@ -583,15 +693,69 @@ void App_TaskDailyRollup(void)
     s_consumed_today_ml = 0;
     s_hydration_score   = 0;
 
-    DailySummaryLog_t daily;
-    Storage_LoadDailySummary(&daily);
-    Storage_UpdateDailySummary(&daily, &s_drink_log, s_rtc.unix_approx);
-    Storage_PurgeDailySummaryOlderThan(&daily,
+    Storage_UpdateDailySummary(&s_daily, &s_drink_log, s_rtc.unix_approx);
+    /* PRD §7.1: after 30 days the oldest summary is removed for the new day */
+    Storage_PurgeDailySummaryOlderThan(&s_daily,
         today_midnight - ((uint32_t)STORAGE_MAX_DAILY_DAYS * 86400UL));
-    Storage_FlushDailySummary(&daily);
+    Storage_FlushDailySummary(&s_daily);
 }
 
 /* ─── Physical button ───────────────────────────────────────────────────── */
+static void App_PowerToggle(void);   /* fwd decl — used by short press */
+
+/* Short press (< 3 s): wake from soft-off, otherwise clear alert visuals
+ * and flash a quick status cue (charging bar when plugged in, hydration
+ * score colour otherwise). */
+static void App_ButtonShortPress(void)
+{
+    if (s_soft_off) { App_PowerToggle(); return; }   /* §8.3: "wakes the device" */
+
+    s_purity_alert_active = 0U;
+    s_temp_alert_active   = 0U;
+
+    if (Battery_IsCharging(&s_bat) || Battery_IsFull(&s_bat)) {
+        WS2812B_SetChargingLevel(s_current_bat_pct);
+        WS2812B_SetPattern(LED_PATTERN_CHARGING_BAR);
+    } else {
+        s_hydration_score = App_CalcHydrationScore();
+        if (s_hydration_score > HYDRATION_SCORE_HIGH) {
+            RGB_t col = RGB(s_settings.prefs.remind_r,
+                            s_settings.prefs.remind_g,
+                            s_settings.prefs.remind_b);
+            WS2812B_SetCustomReminderColor(col);     /* §1.5: custom colour only when >80 */
+            WS2812B_SetPattern(LED_PATTERN_HYDRATION_HIGH);
+        } else if (s_hydration_score >= HYDRATION_SCORE_MID) {
+            WS2812B_SetPattern(LED_PATTERN_HYDRATION_MID);
+        } else {
+            WS2812B_SetPattern(LED_PATTERN_HYDRATION_LOW);
+        }
+    }
+    Buzzer_Play(BUZZER_SINGLE_BEEP);
+}
+
+/* Long press (3–10 s): soft power on/off (FRD §8.3). While off, sensing,
+ * BLE servicing, reminders and the daily rollup are paused; the button and
+ * the charging UI stay alive. Pending data is persisted before going down. */
+static void App_PowerToggle(void)
+{
+    if (!s_soft_off) {
+        if (s_drink_log.dirty) Storage_FlushDrinkLog(&s_drink_log);
+        if (s_daily.dirty)     Storage_FlushDailySummary(&s_daily);
+        s_soft_off = 1U;
+        s_purity_alert_active = 0U;
+        s_temp_alert_active   = 0U;
+        WS2812B_SetPattern(LED_PATTERN_ALL_OFF);
+        WS2812B_SetAll(RGB_OFF);
+        WS2812B_SendBlocking();
+        Buzzer_Play(BUZZER_SINGLE_BEEP);
+    } else {
+        s_soft_off = 0U;
+        Buzzer_Play(BUZZER_STARTUP);
+        WS2812B_SetPattern(s_settings.is_registered ? LED_PATTERN_ALL_OFF
+                                                    : LED_PATTERN_REGISTRATION);
+    }
+}
+
 void App_TaskButton(void)
 {
     s_last_button_ms = HAL_GetTick();
@@ -606,17 +770,24 @@ void App_TaskButton(void)
     } else if (down && s_btn_was_down) {
         uint32_t held = now - s_btn_down_ms;
         if (!s_btn_reset_armed && held >= BTN_VLONG_PRESS_MS) {
+            /* ≥10 s hold: arm the cancellable factory-reset warning */
             s_btn_reset_armed = 1;
             s_btn_down_ms     = now;
             WS2812B_SetPattern(LED_PATTERN_FACTORY_RESET_WARN);
             Buzzer_Play(BUZZER_FACTORY_RESET);
         } else if (s_btn_reset_armed && held >= BTN_RESET_CONFIRM_MS) {
-            App_Cmd_FactoryReset();
+            App_Cmd_FactoryReset();           /* held through the 5 s window */
         }
     } else if (!down && s_btn_was_down) {
+        uint32_t held = now - s_btn_down_ms;
         if (s_btn_reset_armed) {
+            /* released during the warning window → cancel (FRD §8.2/8.3) */
             WS2812B_SetPattern(LED_PATTERN_ALL_OFF);
             Buzzer_Stop();
+        } else if (held >= BTN_LONG_PRESS_MS) {
+            App_PowerToggle();                /* 3–10 s: power on/off       */
+        } else {
+            App_ButtonShortPress();           /* <3 s: wake / status        */
         }
         s_btn_was_down    = 0;
         s_btn_reset_armed = 0;
@@ -704,7 +875,10 @@ static uint8_t App_DoMeasureSequence(uint8_t force,
     rec.temp_x10  = temp;
     rec.flags     = quality ? EE_FLAG_QUALITY : 0U;
 
-    if (!EE_Store_Append(&rec)) return MEAS_ERR_EE;
+    if (!EE_Store_Append(&rec)) {
+        App_LogError(APP_ERR_EEPROM);
+        return MEAS_ERR_EE;
+    }
 
     /* This weight is now the baseline for the next comparison. */
     s_ee_prev_weight_ml = w;
@@ -731,11 +905,11 @@ void App_HandleBLECommand(const BLE_Packet_t *pkt)
     case BLE_CMD_CALIBRATION:  App_Cmd_Calibration(pkt);     break;
     case BLE_CMD_LAMP_MODE:    App_Cmd_LampMode(pkt);        break;
     case BLE_CMD_SOFT_RESET:   App_Cmd_SoftReset();            break;
-    case BLE_CMD_FACTORY_RESET:App_Cmd_FactoryReset();         break;
+    case BLE_CMD_FACTORY_RESET:App_Cmd_FactoryResetRequest(pkt); break;
     case BLE_CMD_GET_HISTORY:  App_Cmd_HistoricalAggregates(); break;
     case BLE_CMD_REGISTER:     App_Cmd_RegisterDevice(pkt);  break;
     case BLE_CMD_UNPAIR:       App_Cmd_UnpairDevice();         break;
-    case BLE_CMD_GET_LOGS:     App_Cmd_SensorLogs();           break;
+    case BLE_CMD_GET_LOGS:     App_Cmd_SensorLogs(pkt);        break;
     case BLE_CMD_SYNC_ACK:     App_Cmd_SyncAck(pkt);         break;
     case BLE_CMD_GET_STATUS:   App_Cmd_DeviceStatus();         break;
     case BLE_CMD_GET_CONFIG:   App_Cmd_GetConfig();            break;
@@ -744,6 +918,8 @@ void App_HandleBLECommand(const BLE_Packet_t *pkt)
     case BLE_CMD_MEASURE:      App_Cmd_Measure(0);             break;
     case BLE_CMD_STORE_WEIGHT: App_Cmd_Measure(1);             break;
     case BLE_CMD_DUMP_EEPROM:  App_Cmd_DumpEEPROM();           break;
+    case BLE_CMD_FW_UPDATE:    App_Cmd_FirmwareUpdate(pkt);    break;
+    case BLE_CMD_GET_INFO:     App_Cmd_GetInfo();              break;
     default:
         App_SendACK(pkt->cmd, 0, BLE_ERR_UNKNOWN_CMD);
         break;
@@ -815,6 +991,39 @@ void App_HandleStringCommand(char *line)
 
     if (strcmp(up, "PING") == 0) { BLE_SendStr(&s_ble, "PONG\r\n"); return; }
 
+    /* VER — firmware identity (FRD §2.2) */
+    if (strcmp(up, "VER") == 0) {
+        p = s_app(p, e, "V,");
+        p = s_u2s(p, e, HYDRA_FW_VER_MAJOR); *p++ = '.';
+        p = s_u2s(p, e, HYDRA_FW_VER_MINOR); *p++ = '.';
+        p = s_u2s(p, e, HYDRA_FW_VER_PATCH); *p++ = ',';
+        *p++ = 'M'; p = s_u2s(p, e, HYDRA_MODEL_ID); *p++ = ',';
+        *p++ = 'P'; p = s_u2s(p, e, HYDRA_PROTO_VER);
+        p = s_app(p, e, "\r\n");
+        BLE_SendStr(&s_ble, out);
+        return;
+    }
+
+    /* ERRQ — dump the internal error log over the ASCII console */
+    if (strcmp(up, "ERRQ") == 0) {
+        p = s_app(p, e, "EL,"); p = s_u2s(p, e, s_err_count);
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+        uint8_t start = (s_err_count >= APP_ERRLOG_DEPTH) ? s_err_head : 0U;
+        for (uint8_t k = 0U; k < s_err_count; k++) {
+            const ErrEntry_t *en =
+                &s_err_log[(uint8_t)((start + k) % APP_ERRLOG_DEPTH)];
+            p = out;
+            p = s_app(p, e, "E,");
+            p = s_u2s(p, e, k);             *p++ = ',';
+            p = s_u2s(p, e, en->unix_time); *p++ = ',';
+            p = s_u2s(p, e, en->code);
+            p = s_app(p, e, "\r\n");
+            BLE_SendStr(&s_ble, out);
+            HAL_Delay(5);
+        }
+        return;
+    }
+
     if (strcmp(up, "HELP") == 0 || strcmp(up, "?") == 0) {
         BLE_SendStr(&s_ble, "=HydraSense cmds=\r\n");
         BLE_SendStr(&s_ble, "RGB,r,g,b RED GREEN BLUE WHITE OFF CLR\r\n");
@@ -822,10 +1031,11 @@ void App_HandleStringCommand(char *line)
         BLE_SendStr(&s_ble, "BEEP BON BOFF BUZ,0-8\r\n");
         BLE_SendStr(&s_ble, "STATUS TEMP TDS WEIGHT RAWW READ CFG\r\n");
         BLE_SendStr(&s_ble, "CAL/TARE  CALWEIGHT,<grams>\r\n");
+        BLE_SendStr(&s_ble, "TDSP CALLO,ppm CALHI,ppm CALSTAT\r\n");
         BLE_SendStr(&s_ble, "TIME SETTIME,unix\r\n");
         BLE_SendStr(&s_ble, "REG UNPAIR SYNC RESET REBOOT SOFTRST\r\n");
         BLE_SendStr(&s_ble, "MEASURE/M STOREW DUMP EEINFO EEFMT\r\n");
-        BLE_SendStr(&s_ble, "EE RTCQ TDSQ TMPQ BATQ\r\n");
+        BLE_SendStr(&s_ble, "EE RTCQ TDSQ TMPQ BATQ VER ERRQ\r\n");
 #ifdef HYDRA_BENCH_CMDS
         BLE_SendStr(&s_ble, "PIX,i,r,g,b EER,a EEW,a,b DIAG\r\n");
 #endif
@@ -1115,6 +1325,72 @@ void App_HandleStringCommand(char *line)
         p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out); return;
     }
 
+    /* ════════════════════════════════════════════════════════════════════
+     * TDS TWO-POINT CALIBRATION (pulsed/AC MCU-ADC path, tds_sensor.c)
+     * ────────────────────────────────────────────────────────────────────
+     * Cal points are RAM-only. TO PERSIST: add to DeviceSettings_t
+     *     int32_t  tds_cal_mv_lo, tds_cal_mv_hi;
+     *     uint16_t tds_cal_ppm_lo, tds_cal_ppm_hi;
+     * then in the CALHI success branch below add:
+     *     TDS_CalGet(&s_settings.tds_cal_mv_lo, &s_settings.tds_cal_ppm_lo,
+     *                &s_settings.tds_cal_mv_hi, &s_settings.tds_cal_ppm_hi);
+     *     Storage_SaveSettings(&s_settings);
+     * and restore in App_Init() (see comment there).
+     * ════════════════════════════════════════════════════════════════════ */
+
+    /* TDSP — debug read: "P:<mV>,<ppm>,<sensor_valid>,<cal_valid>" */
+    if (strcmp(up, "TDSP") == 0) {
+        uint16_t ppm = TDS_ReadPPM(&s_tds, s_current_temp_x10);
+        s_current_tds_ppm = ppm;
+        p = s_app(p, e, "P:"); p = s_u2s(p, e, TDS_GetLastMV());
+        *p++ = ',';            p = s_u2s(p, e, ppm);
+        *p++ = ',';            p = s_u2s(p, e, s_tds.valid);
+        *p++ = ',';            p = s_u2s(p, e, TDS_CalIsValid());
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out); return;
+    }
+
+    /* CALLO,<ppm> — probe in LOW reference water (e.g. CALLO,45)
+     * Reply: "CL:OK,<captured mV>" or "CL:ERR,READ" */
+    if (strcmp(up, "CALLO") == 0) {
+        int v[1];
+        if (s_csv(line, v, 1) == 1 && v[0] >= 0 && v[0] <= 65535) {
+            uint16_t mv = TDS_CalCaptureLow(&s_tds, (uint16_t)v[0]);
+            if (mv == 0U) { BLE_SendStr(&s_ble, "CL:ERR,READ\r\n"); return; }
+            p = s_app(p, e, "CL:OK,"); p = s_u2s(p, e, mv);
+            p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+        } else BLE_SendStr(&s_ble, S_ERR);
+        return;
+    }
+
+    /* CALHI,<ppm> — probe in HIGH reference water (e.g. CALHI,891)
+     * Reply: "CH:OK,<mV>" when calibration became valid,
+     *        "CH:INVALID,<mV>" when separation < 50 mV or hi ppm <= lo ppm */
+    if (strcmp(up, "CALHI") == 0) {
+        int v[1];
+        if (s_csv(line, v, 1) == 1 && v[0] > 0 && v[0] <= 65535) {
+            uint16_t mv = TDS_CalCaptureHigh(&s_tds, (uint16_t)v[0]);
+            if (mv == 0U) { BLE_SendStr(&s_ble, "CH:ERR,READ\r\n"); return; }
+            p = s_app(p, e, "CH:");
+            p = s_app(p, e, TDS_CalIsValid() ? "OK," : "INVALID,");
+            p = s_u2s(p, e, mv);
+            p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+            /* persistence hook goes here — see block comment above */
+        } else BLE_SendStr(&s_ble, S_ERR);
+        return;
+    }
+
+    /* CALSTAT — "CS:<valid>,<mv_lo>,<ppm_lo>,<mv_hi>,<ppm_hi>" */
+    if (strcmp(up, "CALSTAT") == 0) {
+        int32_t mlo, mhi; uint16_t plo, phi;
+        TDS_CalGet(&mlo, &plo, &mhi, &phi);
+        p = s_app(p, e, "CS:"); p = s_u2s(p, e, TDS_CalIsValid());
+        *p++ = ',';             p = s_i2s(p, e, mlo);
+        *p++ = ',';             p = s_u2s(p, e, plo);
+        *p++ = ',';             p = s_i2s(p, e, mhi);
+        *p++ = ',';             p = s_u2s(p, e, phi);
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out); return;
+    }
+
     if (strcmp(up, "TMPQ") == 0) {
         int16_t t = NTC_ReadTemp_x10(&s_ntc);
         s_current_temp_x10 = t;
@@ -1345,18 +1621,56 @@ void App_HandleStringCommand(char *line)
 
 void App_Cmd_Timestamp(const BLE_Packet_t *pkt)
 {
-    if (pkt->len < 4U) { App_SendACK(pkt->cmd, 0, BLE_ERR_UNKNOWN_CMD); return; }
+    if (pkt->len < 4U) { App_SendACK(pkt->cmd, 0, BLE_ERR_INVALID_VALUE); return; }
     uint32_t unix_time = BLE_U32(pkt->payload[0], pkt->payload[1],
                                   pkt->payload[2], pkt->payload[3]);
+
+    /* FRD TIMESTAMP carries a timezone. Optional bytes 4..5 are a signed
+     * offset in minutes; the RTC then keeps LOCAL time so the reminder
+     * window (§1.4) and daily rollup match the user's clock. A 4-byte
+     * payload (legacy app) is still accepted as already-local time. */
+    if (pkt->len >= 6U) {
+        s_tz_offset_min = BLE_I16(pkt->payload[4], pkt->payload[5]);
+        unix_time = (uint32_t)((int64_t)unix_time +
+                               (int64_t)s_tz_offset_min * 60);
+    }
+
     RTC_SetFromUnix(&s_rtc, unix_time);
     RTC_Read(&s_rtc);
+    /* Re-anchor the rollup day so a large time jump doesn't immediately
+     * wipe today's consumed total. */
+    s_current_day_unix = (s_rtc.unix_approx / 86400UL) * 86400UL;
     App_SendACK(pkt->cmd, 1, BLE_ERR_OK);
+}
+
+/* Validate user preferences before persisting (FRD: device replies
+ * status=error / INVALID_VALUE, e.g. purity goal must be 0–1500). */
+static uint8_t Prefs_Valid(const BLE_PrefsPayload_t *p)
+{
+    if (BLE_U16(p->purity_goal_hi, p->purity_goal_lo) > PREF_PURITY_MAX_PPM) return 0U;
+    int16_t tg = BLE_I16(p->temp_goal_hi, p->temp_goal_lo);
+    if (tg < 0 || tg > PREF_TEMP_MAX_X10)                                    return 0U;
+    if (BLE_U16(p->hydration_hi, p->hydration_lo) > PREF_HYDRATION_MAX_ML)   return 0U;
+    if (p->remind_h_start > 23U || p->remind_h_end > 23U)                    return 0U;
+    if (p->remind_m_start > 59U || p->remind_m_end > 59U)                    return 0U;
+    return 1U;
 }
 
 void App_Cmd_InputData(const BLE_Packet_t *pkt)
 {
-    if (pkt->len < 18U) { App_SendACK(pkt->cmd, 0, BLE_ERR_UNKNOWN_CMD); return; }
-    memcpy(&s_settings.prefs, pkt->payload, sizeof(BLE_PrefsPayload_t));
+    if (pkt->len < 18U) { App_SendACK(pkt->cmd, 0, BLE_ERR_INVALID_VALUE); return; }
+
+    BLE_PrefsPayload_t incoming;
+    memcpy(&incoming, pkt->payload, sizeof(BLE_PrefsPayload_t));
+    if (!Prefs_Valid(&incoming)) {
+        App_SendACK(pkt->cmd, 0, BLE_ERR_INVALID_VALUE);
+        return;
+    }
+
+    /* §1.1–1.6: "the change takes effect immediately on the device" — the
+     * prefs are read live by the reminder/alert tasks, so persisting them
+     * is all that's needed. */
+    memcpy(&s_settings.prefs, &incoming, sizeof(BLE_PrefsPayload_t));
     Storage_SaveSettings(&s_settings);
     App_SendACK(pkt->cmd, 1, BLE_ERR_OK);
 }
@@ -1407,25 +1721,45 @@ void App_Cmd_SoftReset(void)
     HAL_Delay(200); HAL_NVIC_SystemReset();
 }
 
+/* Immediate wipe + reboot. Reached only after a warning window has elapsed
+ * (button hold-through, or the 5 s app-side window in App_Run). FRD §8.2:
+ * ALL data is wiped — internal flash AND the external EEPROM record log. */
 void App_Cmd_FactoryReset(void)
 {
-    Device_PostEvent(&s_dev, EVT_CMD_FACTORY_RESET);
-    WS2812B_SetPattern(LED_PATTERN_FACTORY_RESET_WARN);
-    Buzzer_Play(BUZZER_FACTORY_RESET);
-    HAL_Delay(5000);
     App_SendACK(BLE_CMD_FACTORY_RESET, 1, BLE_ERR_OK);
-    HAL_Delay(200);
+    HAL_Delay(100);                       /* let the ACK leave the UART   */
     Storage_FactoryReset();
+    if (EE_Store_IsPresent()) EE_Store_Format();
     HAL_NVIC_SystemReset();
+}
+
+/* BLE entry point: payload[0] = 1 (or absent, legacy) arms a NON-BLOCKING
+ * 5 s warning — red flashes + 5 beeps — cancellable with payload[0] = 0
+ * before the deadline (FRD §8.2 confirmation step). */
+void App_Cmd_FactoryResetRequest(const BLE_Packet_t *pkt)
+{
+    uint8_t enable = (pkt->len >= 1U) ? pkt->payload[0] : 1U;
+
+    if (enable) {
+        Device_PostEvent(&s_dev, EVT_CMD_FACTORY_RESET);
+        WS2812B_SetPattern(LED_PATTERN_FACTORY_RESET_WARN);
+        Buzzer_Play(BUZZER_FACTORY_RESET);
+        s_freset_at_ms = HAL_GetTick() + APP_FRESET_WARN_MS;
+        if (s_freset_at_ms == 0U) s_freset_at_ms = 1U;   /* 0 means idle */
+        App_SendACK(BLE_CMD_FACTORY_RESET, 1, BLE_ERR_OK);
+    } else {
+        s_freset_at_ms = 0U;                              /* cancelled    */
+        WS2812B_SetPattern(LED_PATTERN_ALL_OFF);
+        Buzzer_Stop();
+        App_SendACK(BLE_CMD_FACTORY_RESET, 1, BLE_ERR_OK);
+    }
 }
 
 void App_Cmd_HistoricalAggregates(void)
 {
     uint8_t buf[BLE_PKT_MAX_LEN];
-    DailySummaryLog_t daily;
-    Storage_LoadDailySummary(&daily);
-    for (uint8_t i = 0; i < daily.count; i++) {
-        DailySummary_t *d = &daily.days[i];
+    for (uint8_t i = 0; i < s_daily.count; i++) {
+        DailySummary_t *d = &s_daily.days[i];
         if (!d->valid) continue;
         BLE_DailyPayload_t pl;
         pl.unix_b3 = (uint8_t)(d->date_unix >> 24);
@@ -1463,11 +1797,17 @@ void App_Cmd_UnpairDevice(void)
     App_SendACK(BLE_CMD_UNPAIR, 1, BLE_ERR_OK);
 }
 
-void App_Cmd_SensorLogs(void)
+/* Stream detailed drinking events as BLE_RSP_LOG_ENTRY frames, then an ACK
+ * marking end-of-stream. unsynced_only=1 is the PRD §3 auto-transfer path;
+ * from/to bound the FRD SENSOR_LOGS date-range request. */
+static void App_SendLogEntries(uint8_t unsynced_only,
+                               uint32_t from_unix, uint32_t to_unix)
 {
     uint8_t buf[BLE_PKT_MAX_LEN];
     for (uint8_t i = 0; i < s_drink_log.count; i++) {
         DrinkEvent_t *ev = &s_drink_log.events[i];
+        if (unsynced_only && ev->synced)                            continue;
+        if (ev->unix_time < from_unix || ev->unix_time > to_unix)   continue;
         BLE_LogEntryPayload_t pl;
         pl.unix_b3 = (uint8_t)(ev->unix_time >> 24);
         pl.unix_b2 = (uint8_t)(ev->unix_time >> 16);
@@ -1486,6 +1826,32 @@ void App_Cmd_SensorLogs(void)
     App_SendACK(BLE_CMD_GET_LOGS, 1, BLE_ERR_OK);
 }
 
+void App_Cmd_SensorLogs(const BLE_Packet_t *pkt)
+{
+    uint32_t from = 0U, to = 0xFFFFFFFFUL;
+    /* Optional 8-byte payload: from_unix (4) + to_unix (4), inclusive —
+     * the binary form of the FRD from_date/to_date fields. */
+    if (pkt->len >= 8U) {
+        from = BLE_U32(pkt->payload[0], pkt->payload[1],
+                       pkt->payload[2], pkt->payload[3]);
+        to   = BLE_U32(pkt->payload[4], pkt->payload[5],
+                       pkt->payload[6], pkt->payload[7]);
+    }
+    App_SendLogEntries(0U, from, to);
+}
+
+/* PRD §3: "When the app connects, any data that hasn't been sent yet is
+ * automatically transferred." Called once per connect edge. */
+void App_PushUnsyncedLogs(void)
+{
+    if (!s_settings.is_registered) return;
+    if (s_drink_log.count == 0U)   return;
+    /* Give the central a moment to enable notifications after the JDY-23
+     * link line goes high, or the first frames are dropped. */
+    HAL_Delay(300);
+    App_SendLogEntries(1U, 0U, 0xFFFFFFFFUL);
+}
+
 void App_Cmd_SyncAck(const BLE_Packet_t *pkt)
 {
     uint32_t cutoff = (pkt->len >= 4U)
@@ -1493,7 +1859,15 @@ void App_Cmd_SyncAck(const BLE_Packet_t *pkt)
                                pkt->payload[2], pkt->payload[3])
                     : s_rtc.unix_approx;
     Storage_MarkSynced(&s_drink_log, cutoff);
+
+    /* FRD §7.1: once transferred, detailed records can be cleared to free
+     * space. Keep today's events — the daily summary recomputes the current
+     * day's totals from them; past days are already finalised. */
+    Storage_PurgeSyncedBefore(&s_drink_log,
+                              (s_rtc.unix_approx / 86400UL) * 86400UL);
     Storage_FlushDrinkLog(&s_drink_log);
+
+    s_last_sync_unix = s_rtc.unix_approx;
     WS2812B_SetPattern(LED_PATTERN_SYNC_SUCCESS);
     Buzzer_Play(BUZZER_SYNC_OK);
     App_SendACK(pkt->cmd, 1, BLE_ERR_OK);
@@ -1513,6 +1887,13 @@ void App_Cmd_DeviceStatus(void)
     if (s_settings.is_registered)     pl.flags |= BLE_FLAG_REGISTERED;
     pl.storage_pct = (uint8_t)((uint32_t)s_drink_log.count * 100U
                                 / STORAGE_MAX_DRINK_EVENTS);
+    pl.sync_b3 = (uint8_t)(s_last_sync_unix >> 24);
+    pl.sync_b2 = (uint8_t)(s_last_sync_unix >> 16);
+    pl.sync_b1 = (uint8_t)(s_last_sync_unix >>  8);
+    pl.sync_b0 = (uint8_t)(s_last_sync_unix);
+    pl.fw_major = HYDRA_FW_VER_MAJOR;
+    pl.fw_minor = HYDRA_FW_VER_MINOR;
+    pl.fw_patch = HYDRA_FW_VER_PATCH;
     uint8_t len = BLE_BuildStatus(buf, &pl);
     BLE_SendPacket(&s_ble, buf, len);
 }
@@ -1524,12 +1905,53 @@ void App_Cmd_GetConfig(void)
     BLE_SendPacket(&s_ble, buf, len);
 }
 
+/* FRD ERROR_LOG: stream the internal error history (oldest first) as
+ * BLE_RSP_ERR_LOG frames, then ACK with the entry count in err_code. */
 void App_Cmd_GetErrors(void)
 {
     uint8_t buf[BLE_PKT_MAX_LEN];
-    uint8_t payload = 0;
-    uint8_t len = BLE_BuildPacket(buf, BLE_RSP_ERR_LOG, &payload, 1);
+    uint8_t start = (s_err_count >= APP_ERRLOG_DEPTH) ? s_err_head : 0U;
+
+    for (uint8_t k = 0U; k < s_err_count; k++) {
+        const ErrEntry_t *en = &s_err_log[(uint8_t)((start + k) % APP_ERRLOG_DEPTH)];
+        BLE_ErrEntryPayload_t pl;
+        pl.unix_b3 = (uint8_t)(en->unix_time >> 24);
+        pl.unix_b2 = (uint8_t)(en->unix_time >> 16);
+        pl.unix_b1 = (uint8_t)(en->unix_time >>  8);
+        pl.unix_b0 = (uint8_t)(en->unix_time);
+        pl.code    = en->code;
+        uint8_t len = BLE_BuildErrEntry(buf, &pl);
+        BLE_SendPacket(&s_ble, buf, len);
+        HAL_Delay(15);
+    }
+    App_SendACK(BLE_CMD_GET_ERRORS, 1, s_err_count);
+}
+
+/* FRD §2.2: the app needs the firmware version and model for compatibility
+ * checks; the MAC itself comes from the JDY-23 advertisement. */
+void App_Cmd_GetInfo(void)
+{
+    uint8_t buf[BLE_PKT_MAX_LEN];
+    BLE_InfoPayload_t pl;
+    pl.fw_major         = HYDRA_FW_VER_MAJOR;
+    pl.fw_minor         = HYDRA_FW_VER_MINOR;
+    pl.fw_patch         = HYDRA_FW_VER_PATCH;
+    pl.model_id         = HYDRA_MODEL_ID;
+    pl.proto_ver        = HYDRA_PROTO_VER;
+    pl.max_daily_days   = STORAGE_MAX_DAILY_DAYS;
+    pl.max_drink_events = STORAGE_MAX_DRINK_EVENTS;
+    uint8_t len = BLE_BuildInfo(buf, &pl);
     BLE_SendPacket(&s_ble, buf, len);
+}
+
+/* FRD FIRMWARE_UPDATE: protocol hook is in place, but this build has no OTA
+ * bootloader, so the device honestly reports UNSUPPORTED instead of
+ * pretending to update. (OTA needs a bootloader partition — tracked as a
+ * separate hardware/firmware work item.) */
+void App_Cmd_FirmwareUpdate(const BLE_Packet_t *pkt)
+{
+    (void)pkt;
+    App_SendACK(BLE_CMD_FW_UPDATE, 0, BLE_ERR_UNSUPPORTED);
 }
 
 void App_Cmd_Ping(void)

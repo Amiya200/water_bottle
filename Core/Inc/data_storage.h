@@ -29,8 +29,15 @@
 /* ─── Magic number & array sizes ────────────────────────────────────────── */
 #define SETTINGS_MAGIC              0xA55A1235UL   /* v2: fixed-point HX711 scale */
 
-#define STORAGE_MAX_DRINK_EVENTS    12U   /* more optimised: 12 × 12 = 144 B */
-#define STORAGE_MAX_DAILY_DAYS       7U   /* more optimised: 7 × 12 = 84 B */
+/* PRD/FRD v2.0 §7.1:
+ *  - Daily summaries MUST be kept for 30 days on-device (was 7).
+ *    30 × 12 = 360 B + header — still fits the 1 KB daily flash page.
+ *  - Detailed events are kept until synced, then purged (see
+ *    Storage_PurgeSyncedBefore). 20 events covers a full day of typical
+ *    drinking between syncs (one event ≈ every 30 min over ~10 h).
+ */
+#define STORAGE_MAX_DRINK_EVENTS    12U   /* 12 × 12 = 144 B — RAM-constrained, see note */
+#define STORAGE_MAX_DAILY_DAYS      30U   /* PRD v2 hard requirement: 30 days */
 
 /* ─── BLE preferences payload ───────────────────────────────────────────── */
 typedef struct {
@@ -126,6 +133,12 @@ void Storage_AddDrinkEvent(DrinkLog_t *log, const DrinkEvent_t *ev);
 void Storage_FlushDrinkLog(DrinkLog_t *log);
 void Storage_LoadDrinkLog(DrinkLog_t *log);
 void Storage_MarkSynced(DrinkLog_t *log, uint32_t cutoff_unix);
+
+/* FRD §7.1: once detailed records are transferred (SYNC_ACK), they can be
+ * cleared to free space. Removes events that are BOTH synced AND older than
+ * cutoff_unix (pass today's midnight so today's events survive for the
+ * daily-summary recompute). */
+void Storage_PurgeSyncedBefore(DrinkLog_t *log, uint32_t cutoff_unix);
 
 void Storage_UpdateDailySummary(DailySummaryLog_t *daily,
                                  DrinkLog_t *log,
