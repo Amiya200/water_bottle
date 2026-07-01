@@ -54,6 +54,11 @@ static void MX_TIM1_Init(void);
 static void MX_TIM3_Init(void);
 
 /* USER CODE BEGIN PFP */
+/* Defined in app_logic.c. Re-arms the JDY BLE UART's 1-byte IT reception
+ * after a UART error aborted it (see HAL_UART_ErrorCallback below). Declared
+ * here so main.c compiles without editing the CubeMX-owned header; you may
+ * instead move this prototype into app_logic.h if you prefer. */
+extern void App_BLE_RxRecover(void);
 /* USER CODE END PFP */
 
 int main(void)
@@ -484,6 +489,25 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1) {
     App_BLE_RxISR();
+  }
+}
+
+/* UART error: a long blocking operation (e.g. TARE, which bit-bangs the
+ * HX711 for a while) can coincide with an RX overrun / noise / framing
+ * error on the JDY BLE line. HAL's default behaviour on such an error is to
+ * abort IT reception and NOT re-arm it — after which App_BLE_RxISR() never
+ * fires again and the device silently ignores every command ("BLE stops
+ * responding after TARE"). Clear the error flags and restart reception. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1) {
+    __HAL_UART_CLEAR_OREFLAG(huart);   /* overrun  */
+    __HAL_UART_CLEAR_NEFLAG(huart);    /* noise    */
+    __HAL_UART_CLEAR_FEFLAG(huart);    /* framing  */
+    __HAL_UART_CLEAR_PEFLAG(huart);    /* parity   */
+    /* HAL has already set RxState = READY inside its error handling, so the
+     * BLE driver can immediately re-arm HAL_UART_Receive_IT(). */
+    App_BLE_RxRecover();
   }
 }
 

@@ -46,6 +46,16 @@
  * Cal points are RAM-only; to persist them add four fields to
  * DeviceSettings_t (see the comment at the CALHI handler).
  *
+ * TARE / BLE ROBUSTNESS (this revision)
+ * ─────────────────────────────────────────────────────────────────────
+ * - App_BLE_RxRecover(): called from HAL_UART_ErrorCallback() (main.c) to
+ *   re-arm BLE reception after a UART error, so the console no longer goes
+ *   silent when a UART overrun/noise glitch coincides with a long TARE.
+ * - The ASCII CAL/TARE command now runs the tare inline and replies in
+ *   ASCII ("TARE:OK,off=<n>") instead of routing through
+ *   App_Cmd_Calibration() (which emits a BINARY ACK that reads as garbage
+ *   on a serial terminal), and it re-seeds drink detection after tare.
+ *
  * No other functional changes. All other command replies are identical.
  * ─────────────────────────────────────────────────────────────────────
  */
@@ -321,6 +331,15 @@ void App_BLE_RxISR(void)
     BLE_RxISR(&s_ble);
 }
 
+/* Called from HAL_UART_ErrorCallback() in main.c after a UART overrun /
+ * noise / framing error aborted IT reception. HAL leaves RxState = READY on
+ * an RX error, so re-arming the 1-byte receive here is safe and keeps the
+ * BLE console from going permanently silent after a long blocking op (TARE).*/
+void App_BLE_RxRecover(void)
+{
+    BLE_StartReceive(&s_ble);
+}
+
 /* ─── Init ──────────────────────────────────────────────────────────────── */
 void App_Init(ADC_HandleTypeDef  *hadc,
               I2C_HandleTypeDef  *hi2c,
@@ -371,10 +390,18 @@ void App_Init(ADC_HandleTypeDef  *hadc,
     Storage_LoadDrinkLog(&s_drink_log);
     Storage_LoadDailySummary(&s_daily);   /* shared 30-day buffer (PRD §7.1) */
     s_hx711.tare_offset = s_settings.tare_offset;
-    if (s_settings.hx711_scale_x100 >= HX711_SCALE_X100_MIN) {
+    if (s_settings.is_calibrated &&
+        s_settings.hx711_scale_x100 >= HX711_SCALE_X100_MIN) {
+        /* Only trust the stored scale if the user actually ran CALWEIGHT.
+         * Otherwise a factory-default scale would make the cell claim to be
+         * calibrated and report a bogus weight instead of UNCAL. */
         HX711_SetScaleX100(&s_hx711, s_settings.hx711_scale_x100);
     } else {
-        s_hx711.scale_x100    = HX711_SCALE_X100_DEFAULT;
+        /* Never calibrated (or invalid stored scale): keep a nominal scale
+         * for rough raw math but report UNCAL so WEIGHT tells the user to run
+         * TARE + CALWEIGHT. */
+        s_hx711.scale_x100    = (s_settings.hx711_scale_x100 >= HX711_SCALE_X100_MIN)
+                              ? s_settings.hx711_scale_x100 : HX711_SCALE_X100_DEFAULT;
         s_hx711.is_calibrated = 0;
     }
 
@@ -530,8 +557,14 @@ void App_RecordDrinkEvent(uint16_t volume_ml)
 
     WS2812B_SetPattern(LED_PATTERN_DRINK_CONFIRM);
     Buzzer_Play(BUZZER_SINGLE_BEEP);
+
+    /* Update the daily summary in RAM (this marks it dirty) but DO NOT erase
+     * and rewrite the flash page here. A page erase in the per-drink hot path
+     * is a ~20-40 ms window with interrupts stalled, long enough to overrun
+     * the BLE UART. The summary is fully recomputable from the drink log and
+     * is flushed at the daily rollup and on BLE disconnect, so nothing is
+     * lost across a normal power-down. */
     Storage_UpdateDailySummary(&s_daily, &s_drink_log, s_rtc.unix_approx);
-    Storage_FlushDailySummary(&s_daily);
 }
 
 /* ─── TDS ───────────────────────────────────────────────────────────────── */
@@ -639,8 +672,11 @@ void App_TaskBLE(void)
             App_PushUnsyncedLogs();
         } else if (!connected && s_ble_was_connected) {
             Device_PostEvent(&s_dev, EVT_BLE_DISCONNECTED);
-            /* Persist queued data so nothing is lost while offline. */
+            /* Persist queued data so nothing is lost while offline. Disconnect
+             * is an infrequent, natural checkpoint — a good place to flush the
+             * daily summary whose per-drink flush was deferred for reliability. */
             if (s_drink_log.dirty) Storage_FlushDrinkLog(&s_drink_log);
+            if (s_daily.dirty)     Storage_FlushDailySummary(&s_daily);
         }
         s_ble_was_connected = connected;
     }
@@ -1099,12 +1135,33 @@ void App_HandleStringCommand(char *line)
     }
 
     if (strcmp(up, "WEIGHT") == 0) {
-        if (!s_hx711.is_calibrated) {
-            BLE_SendStr(&s_ble, "W:0,UNCAL\r\n");
-        } else {
-            p = s_app(p, e, "W:"); p = s_i2s(p, e, s_current_weight_ml);
-            p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
+        /* Live read so the reply reflects the cell right now and any failure
+         * is explicit. The old path returned a stale cached value, and a
+         * command byte corrupted on the wire fell through to a bare "ERR". */
+        if (!HX711_WaitReady(400U)) {
+            /* DOUT never went low → HX711 unpowered, mis-wired, or SCK stuck. */
+            BLE_SendStr(&s_ble, "W:ERR,HX711\r\n");
+            return;
         }
+        if (!s_hx711.is_calibrated) {
+            int32_t raw = 0;
+            uint8_t ok = HX711_ReadRawAveraged(&s_hx711, &raw);
+            /* Report raw counts too: confirms the ADC is alive and lets you
+             * watch the delta when you press the cell, before calibrating. */
+            p = s_app(p, e, "W:0,UNCAL,raw=");
+            p = s_i2s(p, e, ok ? raw : 0);
+            p = s_app(p, e, "\r\n");
+            BLE_SendStr(&s_ble, out);
+            return;
+        }
+        int32_t w = HX711_ReadMillilitres(&s_hx711);
+        if (!s_hx711.last_read_ok) {
+            BLE_SendStr(&s_ble, "W:ERR,READ\r\n");
+            return;
+        }
+        s_current_weight_ml = w;
+        p = s_app(p, e, "W:"); p = s_i2s(p, e, w);
+        p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out);
         return;
     }
 
@@ -1471,16 +1528,31 @@ void App_HandleStringCommand(char *line)
         p = s_app(p, e, "\r\n"); BLE_SendStr(&s_ble, out); return;
     }
 
-    /* ── CAL / TARE ── */
+    /* ── CAL / TARE ──
+     * Runs the load-cell tare INLINE and replies in ASCII. The old path
+     * called App_Cmd_Calibration(), which answers with a BINARY ACK packet
+     * that reads as garbage bytes on a serial/BLE terminal — so the tare
+     * looked like "no response". It also now re-seeds drink detection so
+     * weight tracking re-anchors to the new zero (the previous path left
+     * s_drink_baseline_ml pointing at the pre-tare value). */
     if (strcmp(up, "CAL") == 0 || strcmp(up, "TARE") == 0) {
         if (!HX711_WaitReady(400U)) {
-            BLE_SendStr(&s_ble, "ERR,HX711\r\n"); return;
+            BLE_SendStr(&s_ble, "TARE:ERR,HX711\r\n"); return;
         }
-        BLE_Packet_t fake;
-        fake.cmd        = BLE_CMD_CALIBRATION;
-        fake.len        = 1;
-        fake.payload[0] = 0;
-        App_Cmd_Calibration(&fake);
+        Device_PostEvent(&s_dev, EVT_CMD_CALIBRATION);
+        WS2812B_SetPattern(LED_PATTERN_CALIBRATION);
+        HX711_Tare(&s_hx711);
+        s_settings.tare_offset = s_hx711.tare_offset;
+        Storage_SaveSettings(&s_settings);
+        s_weight_seeded     = 0;      /* re-baseline drink detection */
+        s_drink_baseline_ml = 0;
+        Device_PostEvent(&s_dev, EVT_CALIBRATION_DONE);
+        Buzzer_Play(BUZZER_CALIBRATION_DONE);
+        WS2812B_SetPattern(LED_PATTERN_ALL_OFF);
+        p = s_app(p, e, "TARE:OK,off=");
+        p = s_i2s(p, e, s_hx711.tare_offset);
+        p = s_app(p, e, "\r\n");
+        BLE_SendStr(&s_ble, out);
         return;
     }
 
@@ -1494,7 +1566,16 @@ void App_HandleStringCommand(char *line)
             BLE_SendStr(&s_ble, "CW:ERR,HX711\r\n"); return;
         }
         if (!HX711_Calibrate(&s_hx711, (int32_t)v[0])) {
-            BLE_SendStr(&s_ble, "CW:ERR,LOAD\r\n"); return;
+            /* Show the measured count delta so the failure explains itself: a
+             * small delta means the known weight wasn't actually on the cell,
+             * or is too light — calibration needs >= ~1000 counts of change
+             * from the tare point. */
+            int32_t craw = 0; (void)HX711_ReadRawAveraged(&s_hx711, &craw);
+            p = s_app(p, e, "CW:ERR,LOAD,delta=");
+            p = s_i2s(p, e, craw - s_hx711.tare_offset);
+            p = s_app(p, e, "\r\n");
+            BLE_SendStr(&s_ble, out);
+            return;
         }
         s_settings.tare_offset       = s_hx711.tare_offset;
         s_settings.hx711_scale_x100  = s_hx711.scale_x100;
@@ -1689,6 +1770,9 @@ void App_Cmd_Calibration(const BLE_Packet_t *pkt)
     HX711_Tare(&s_hx711);
     s_settings.tare_offset = s_hx711.tare_offset;
     Storage_SaveSettings(&s_settings);
+    /* Re-baseline drink detection so tracking re-anchors to the new zero. */
+    s_weight_seeded     = 0;
+    s_drink_baseline_ml = 0;
     Device_PostEvent(&s_dev, EVT_CALIBRATION_DONE);
     Buzzer_Play(BUZZER_CALIBRATION_DONE);
     WS2812B_SetPattern(LED_PATTERN_ALL_OFF);

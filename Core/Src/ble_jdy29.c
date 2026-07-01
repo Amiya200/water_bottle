@@ -13,6 +13,20 @@
  *               site; removing it saves the function body + PLT entry.
  *
  * Flash –30 B  : static BLE_AT() helper moved inside the #ifdef block.
+ *
+ * RELIABILITY FIX (this revision)
+ * ─────────────────────────────────────────────────────────────────────
+ * RX overrun (ORE) is now DISABLED on this UART (see BLE_Init). Reception
+ * is parsed byte-by-byte inside the ISR, re-arming HAL_UART_Receive_IT()
+ * each byte; that chain only ever breaks on a UART error. The error that
+ * bites here is overrun: flash erase/program (Storage_Flush/Save*) stalls
+ * the core for tens of ms, during which the RX interrupt cannot run, so a
+ * byte arriving in that window overruns. Depending on the HAL version an
+ * ORE can leave RXNE reception wedged — after which App_BLE_RxISR() never
+ * fires again and BLE goes silent until power-cycle ("works for a few
+ * minutes then dies"). For a command console, dropping the overrun byte
+ * (the command is simply resent) is the correct trade, and it removes the
+ * entire ORE-wedges-RX failure class. OVRDIS is only writable while UE=0.
  * ─────────────────────────────────────────────────────────────────────
  */
 
@@ -34,6 +48,15 @@ void BLE_Init(BLE_Handle_t *hble, UART_HandleTypeDef *huart)
     hble->conn_state   = BLE_STATE_DISCONNECTED;
     memset(hble->pkt_buf,  0, sizeof(hble->pkt_buf));
     memset(hble->line_buf, 0, sizeof(hble->line_buf));
+
+    /* Disable RX overrun (OVRDIS). On a command console a dropped byte just
+     * means the command is resent; letting ORE fire can wedge IT reception
+     * after a flash-write interrupt-blackout and kill BLE until power-cycle.
+     * OVRDIS can only be changed while the USART is disabled (UE=0). Done
+     * once here, before BLE_StartReceive() arms the first byte. */
+    __HAL_UART_DISABLE(huart);
+    huart->Instance->CR3 |= USART_CR3_OVRDIS;
+    __HAL_UART_ENABLE(huart);
 }
 
 void BLE_StartReceive(BLE_Handle_t *hble)
